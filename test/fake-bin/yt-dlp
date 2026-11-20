@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+// A pretend yt-dlp for tests: understands just enough of the real arguments.
+const fs = require('fs');
+const path = require('path');
+const args = process.argv.slice(2);
+const url = args[args.indexOf('--') + 1] || args[args.length - 1];
+const get = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : null; };
+
+if (args.includes('--version')) { console.log('2026.11.01'); process.exit(0); }
+
+// Borrowing cookies from a browser: writes out the whole browser cookie store on exit.
+if (url === 'about:blank' && get('--cookies-from-browser')) {
+  const b = get('--cookies-from-browser');
+  if (b === 'chrome') { console.error('ERROR: Failed to decrypt with DPAPI. See  https://github.com/yt-dlp/yt-dlp/issues/10927  for more info'); process.exit(1); }
+  const lines = ['# Netscape HTTP Cookie File', '',
+    '.othersite.com\tTRUE\t/\tTRUE\t1999999999\tsession\tsecret-elsewhere',
+    '#HttpOnly_.cfbare-site.net\tTRUE\t/\tTRUE\t1999999999\tcf_clearance\tfrom-' + b,
+    'cfbare-site.net\tFALSE\t/\tFALSE\t0\tage_ok\t1'];
+  if (b === 'edge') lines.splice(3, 1); // this browser never passed the check
+  fs.writeFileSync(get('--cookies'), lines.join('\n') + '\n');
+  console.error("ERROR: [generic] 'about:blank' is not a valid URL.");
+  process.exit(1);
+}
+
+// A site behind Cloudflare: only works when connecting like a browser.
+if (/cfblock/.test(url) && !args.includes('--impersonate')) {
+  console.error('ERROR: [generic] Got HTTP Error 403 caused by Cloudflare anti-bot challenge; try again with  --extractor-args "generic:impersonate"');
+  process.exit(1);
+}
+// A strict site: after the browser retry it answers with a bare 403 (like the real one did).
+if (/cfbare/.test(url)) {
+  if (!args.includes('--impersonate')) console.error('ERROR: [generic] Got HTTP Error 403 caused by Cloudflare anti-bot challenge; try again with  --extractor-args "generic:impersonate"');
+  else if (!args.includes('--cookies')) console.error('ERROR: [generic] somechannel: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)');
+  if (!args.includes('--cookies') || !args.includes('--impersonate')) process.exit(1);
+}
+// A normal site that answers 403 for a private video: nothing to do with Cloudflare.
+if (/plain403/.test(url)) { console.error('ERROR: [generic] x: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)'); process.exit(1); }
+// A site whose Cloudflare is strict: only works with the pass cookie.
+if (/cfstrict/.test(url) && !args.includes('--cookies')) {
+  console.error('ERROR: [generic] Got HTTP Error 403 caused by Cloudflare anti-bot challenge; try again with  --extractor-args "generic:impersonate"');
+  process.exit(1);
+}
+
+if (args.includes('-J')) {
+  if (/anonlist/.test(url)) {
+    // A profile list that doesn't say who uploaded it.
+    console.log(JSON.stringify({ _type: 'playlist', id: 'anon', extractor_key: 'SomeSite',
+      entries: [{ _type: 'url', id: 'a1', url: 'https://www.example.com/video/a1' }, { _type: 'url', id: 'a2', url: 'https://www.example.com/video/a2' }] }));
+    process.exit(0);
+  }
+  if (/\/video\/a\d/.test(url)) {
+    console.log(JSON.stringify({ id: url.slice(-2), title: 'Clip ' + url.slice(-2), uploader: 'Some Creator', extractor_key: 'SomeSite', duration: 90, webpage_url: url, formats: [{ height: 720 }] }));
+    process.exit(0);
+  }
+  if (/nouploader/.test(url)) {
+    console.log(JSON.stringify({ id: 'nouploader', title: 'No Uploader Clip', extractor_key: 'SomeSite', duration: 60, webpage_url: url, formats: [{ height: 720 }] }));
+    process.exit(0);
+  }
+  if (/unsupported/.test(url)) { console.error('ERROR: Unsupported URL: ' + url); process.exit(1); }
+  if (/channel/.test(url)) {
+    console.log(JSON.stringify({ _type: 'playlist', title: 'Jimmy The Lawn Guy - Videos', channel: 'Jimmy The Lawn Guy', extractor_key: 'YoutubeTab',
+      entries: [
+        { _type: 'url', ie_key: 'Youtube', id: 'v3', title: 'Jimmy Cuts Grass', duration: 930, url: 'https://www.youtube.com/watch?v=v3' },
+        { _type: 'url', ie_key: 'Youtube', id: 'v2', title: 'Leaf Blower Showdown', duration: 500, url: 'https://www.youtube.com/watch?v=v2' },
+        { _type: 'url', ie_key: 'Youtube', id: 'v1', title: 'Jimmy Cuts Grass', duration: 768, url: 'https://www.youtube.com/watch?v=v1' }
+      ] }));
+  } else {
+    console.log(JSON.stringify({ id: 'solo', title: 'Solo: Video?', channel: 'Solo Channel', extractor_key: 'Youtube', duration: 61,
+      webpage_url: url, formats: [{ height: 720 }, { height: 1080 }, { height: null }] }));
+  }
+  process.exit(0);
+}
+
+const out = get('-o');
+if (!out) { console.error('ERROR: no output'); process.exit(2); }
+
+const id = (url.match(/v=([^&]+)/) || [, 'x'])[1];
+if (/fail/.test(url)) { console.error('ERROR: [youtube] ' + id + ': Video unavailable'); process.exit(1); }
+if (/flaky/.test(url)) {
+  const marker = path.join(process.env.FAKE_STATE_DIR || '/tmp', 'flaky-' + id);
+  if (!fs.existsSync(marker)) { fs.writeFileSync(marker, '1'); console.error('ERROR: Unable to download webpage: timed out'); process.exit(1); }
+}
+if (/needsconvert/.test(url) && !args.includes('--recode-video')) { console.error('ERROR: Postprocessing: Conversion failed!'); process.exit(1); }
+if (/slow/.test(url)) {
+  let n = 0;
+  const t = setInterval(() => { console.log(`STPROG|downloading|${n * 1000}|100000|NA|50000|10|NA|NA`); if (++n > 200) clearInterval(t); }, 50);
+  return;
+}
+
+const fmt = get('--remux-video') || get('--recode-video') || get('--audio-format') || get('--merge-output-format') || 'mp4';
+const file = out.replace('.%(ext)s', '.' + fmt).replace(/%%/g, '%');
+for (let i = 1; i <= 4; i++) console.log(`STPROG|downloading|${i * 2500}|10000|NA|1000000|${4 - i}|NA|NA`);
+console.log('[Merger] Merging formats into "' + file + '"');
+fs.mkdirSync(path.dirname(file), { recursive: true });
+fs.writeFileSync(file, 'video-bytes-' + id);
+const dur = /v1/.test(id) ? 768 : /v3/.test(id) ? 930 : 61;
+console.log(`STDONE|${file}|1700000000|20231114|${dur}|${id}|Youtube`);

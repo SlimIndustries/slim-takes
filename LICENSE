@@ -1,0 +1,25 @@
+Copyright (c) 2026 Slim Industries. All rights reserved.
+
+Slim Takes and its source code, name, logo and artwork are the property of Slim Industries.
+
+You may download and use the official Slim Takes releases for free, for personal use.
+You may view the source code in this repository.
+
+You may NOT, without written permission from Slim Industries:
+  - copy, modify, re-release or redistribute this software or its source code,
+  - publish it (or anything based on it) under another name or logo,
+  - sell it or include it in another product.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT SHALL SLIM INDUSTRIES
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+Third-party software
+--------------------
+Slim Takes downloads and runs these separate programs, which keep their own licenses:
+  yt-dlp (Unlicense) - https://github.com/yt-dlp/yt-dlp
+  FFmpeg (GPL)       - https://ffmpeg.org
+  Deno (MIT)         - https://deno.com
+The app window is built with Electron (MIT) - https://www.electronjs.org
+Fonts: Inter and Anton, SIL Open Font License 1.1 (see src/renderer/fonts).
+
+Contact: slimindustries.apps@gmail.com

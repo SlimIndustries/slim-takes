@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const file = process.argv[process.argv.length - 1];
+let body = '';
+try { body = fs.readFileSync(file, 'utf8'); } catch { process.exit(1); }
+const m = body.match(/dur=(\d+)/);
+console.log(m ? m[1] : (/v1/.test(body) ? '768' : /v3/.test(body) ? '930' : '61'));

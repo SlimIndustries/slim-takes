@@ -1,0 +1,51 @@
+{
+  "name": "slim-takes",
+  "productName": "Slim Takes",
+  "version": "1.2.0",
+  "description": "Download videos and audio from YouTube and 1,000+ sites. Free, no limits.",
+  "main": "main.js",
+  "author": "Slim Industries <slimindustries.apps@gmail.com>",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://github.com/slimindustries/slim-takes",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/",
+    "dist": "electron-builder --win portable --x64",
+    "dist:installer": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.slimindustries.slimtakes",
+    "productName": "Slim Takes",
+    "copyright": "© 2026 Slim Industries. All rights reserved.",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "assets/**/*",
+      "package.json",
+      "!test/**/*"
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "SlimTakes-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "SlimTakes-${version}-setup.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
