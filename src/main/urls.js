@@ -40,4 +40,26 @@ function siteName(info) {
   return known[clean] || clean || 'Web';
 }
 
-module.exports = { extractLinks, youtubeChannelBase, youtubeTabs, siteName };
+/**
+ * Does this link point at one video (not a channel, profile or playlist)?
+ * Used so a single video never opens as a list of everything on its page.
+ */
+function looksLikeVideo(url) {
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  const p = u.pathname.toLowerCase();
+  if (/(^|\.)youtu\.be$/i.test(u.hostname)) return p.length > 1;
+  // Clear signs of a single video.
+  if (u.searchParams.has('v')) return true;
+  if (/\/(video|watch|status|shorts|reel|clip)\/[^/]+/.test(p)) return true;
+  // Channels, profiles, playlists and other lists.
+  if (/\/(playlist|playlists|channel|channels|user|users|c|profile|profiles|model|models|creator|creators|series|collection|collections|category|categories|tag|tags|search)(\/|$)/.test(p)) return false;
+  if (/^\/@/.test(p)) return false;
+  // Weaker signs.
+  if (/\/(v|embed|clips|reels|live|p)\/[^/]+/.test(p)) return true;
+  if (/\/videos\/\d+/.test(p)) return true;
+  if (/^\/\d{5,}\/?$/.test(p)) return true;
+  return /\.(mp4|webm|mov|m4v|mkv|m3u8)$/.test(p);
+}
+
+module.exports = { looksLikeVideo, extractLinks, youtubeChannelBase, youtubeTabs, siteName };

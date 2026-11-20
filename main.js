@@ -14,15 +14,15 @@ const { Prober } = require('./src/main/probe');
 const { Queue } = require('./src/main/queue');
 const { History } = require('./src/main/history');
 const { Watch } = require('./src/main/watch');
-const { extractLinks } = require('./src/main/urls');
+const { extractLinks, looksLikeVideo } = require('./src/main/urls');
 const { estimateBytes } = require('./src/main/formats');
 const settingsMod = require('./src/main/settings');
 const { serveFile } = require('./src/main/range');
 const { FolderSync } = require('./src/main/sync');
-const { pageScan, openVisible, scanVisible, closeVisible, clearScanData, followLinks, fetchPage, siteCookies, usePass, isScanningVisible } = require('./src/main/pagescan');
-const { BROWSERS, LABEL: BROWSER_LABEL, browserIdentity, exportBrowserCookies } = require('./src/main/browserpass');
-const { Sites } = require('./src/main/sites');
-const { uploaderFromHtml, nameFromUrl } = require('./src/main/scanlogic');
+const { pageScan, openVisible, scanVisible, closeVisible, clearScanData, followLinks, fetchPage, siteCookies, usePass, isScanningVisible, freshWindowPass, grabMedia } = require('./src/main/pagescan');
+const { BROWSERS, LABEL: BROWSER_LABEL, browserIdentity, exportBrowserCookies, readCookieFile } = require('./src/main/browserpass');
+const { Sites, hostOf } = require('./src/main/sites');
+const { uploaderFromHtml, nameFromUrl, cleanPageTitle } = require('./src/main/scanlogic');
 const { cleanName } = require('./src/main/naming');
 const { chooseVideos } = require('./src/main/choose');
 
@@ -74,7 +74,8 @@ const queue = new Queue({
   engine, library, getSettings: S, log, history,
   store: new JsonStore(path.join(dataDir, 'queue.json'), []),
   notify: { done: (it) => notifyDone(it), failed: (it) => notifyFailed(it) },
-  sites
+  sites,
+  resolveDirect: (url, { quiet } = {}) => grabDirect(url, { quiet })
 });
 const watch = new Watch({ store: new JsonStore(path.join(dataDir, 'watch.json'), { channels: [], lastRun: 0 }), prober, queue, library, getSettings: S, log, scanList: (url) => scanList(url) });
 
@@ -229,6 +230,12 @@ function notifyFailed(it) {
 queue.on('item', (v) => send('queue:item', v));
 queue.on('list', () => send('queue:list', queue.list()));
 queue.on('state', () => send('queue:state', { paused: queue.paused }));
+// A site's downloads are held until it gets a fresh pass: say so once.
+queue.on('needsPass', ({ host, count, private: priv }) => {
+  const where = priv ? 'a site' : host;
+  send('queue:needsPass', { host: priv ? null : host, count });
+  showNotification('Downloads waiting for a fresh pass', `${count} download${count === 1 ? '' : 's'} from ${where} ${count === 1 ? 'is' : 'are'} waiting. In Slim Takes, use "Open the page" (or your normal browser) to get past the site's check: they'll carry on by themselves.`);
+});
 queue.on('diskLow', (free) => {
   send('queue:diskLow', free);
   showNotification('Downloads paused', `Only ${(free / 1e9).toFixed(1)} GB left on the drive.`);
@@ -348,29 +355,144 @@ handle('engine:version', () => engine.version());
 
 handle('links:extract', (text) => extractLinks(text));
 
+// ---------- sites that refuse the engine: get the video through the page window ----------
+// The page window can view the page; it lets the player start, notes the video file it asks for,
+// and that file is downloaded with the window's pass and identity.
+async function grabDirect(url, { quiet = false, useVisible = false } = {}) {
+  log.info(quiet ? 'Getting a video from its page (private mode)' : 'Getting the video from its page: ' + url);
+  const pass = await ensureBrowserPass(url);
+  let g;
+  try {
+    g = await grabMedia(url, { useVisible, log: quiet ? null : log });
+  } catch (e) {
+    if (e.siteCheck) {
+      log.info('Page window: the site\'s check came up' + (pass.from ? ` (using the pass from ${pass.from === 'browser' ? 'your browser' : 'the page window'}${pass.expired ? ', which has expired' : ''})` : ' (no pass saved)'));
+      e.passExpired = !!pass.expired;
+      e.bothRefused = sites.hasPass(url);
+    }
+    throw e;
+  }
+  return { mediaUrl: g.media.url, referer: g.at || url, ua: g.ua, cookieFile: sites.writeDirectCookies(url, g.cookies), grab: g };
+}
+
+// The page window keeps cookies only in memory: after a restart, load the pass borrowed from the
+// user's browser back in (it's saved on disk for the engine). Also says if that pass has run out.
+const loadedPasses = new Set();
+async function ensureBrowserPass(url) {
+  const from = sites.passFrom(url);
+  if (from !== 'browser') return { from };
+  const host = hostOf(url);
+  const entry = sites.get(host);
+  let cookies = [];
+  try { cookies = readCookieFile(fs.readFileSync(entry.pass.file, 'utf8'), host); } catch { return { from }; }
+  const cf = cookies.find((c) => /^cf_clearance$/i.test(c.name));
+  const expired = !!(cf && cf.expirationDate && cf.expirationDate * 1000 < Date.now());
+  if (!loadedPasses.has(host)) {
+    await usePass(url, cookies, entry.pass.ua);
+    loadedPasses.add(host);
+  }
+  return { from, expired };
+}
+
+// What to tell the user when a site's protection stops a lookup.
+function blockedMessage(e) {
+  if (e && e.passExpired) return 'Page scan: your browser pass for this site has expired. Press "Open the page", then "Check keeps repeating? Use your normal browser instead", and do the steps again.';
+  if (e && e.bothRefused) return 'Page scan: this site refused Slim Takes even with your pass (it\'s blocking download apps right now). If your normal browser shows an "are you human" check on this page, tick it there, then press "Open the page" → "Use your normal browser instead" → Done. Otherwise try again later.';
+  return 'Page scan: this site is protected by Cloudflare. Press "Open the page", tick the "I\'m human" box if it shows one, then press Scan now.';
+}
+const isSiteCheck = (e) => !!(e && (e.siteCheck || e.passExpired || e.bothRefused));
+
+async function grabVideo(url, opts = {}) {
+  const d = await grabDirect(url, opts);
+  const g = d.grab;
+  delete d.grab;
+  let host = '';
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+  const uploader = uploaderFromHtml(g.html);
+  const segs = (() => { try { return new URL(url).pathname.split('/').filter(Boolean); } catch { return []; } })();
+  return {
+    kind: 'video',
+    url,
+    id: segs[segs.length - 1] || url,
+    extractor: 'Generic',
+    site: host,
+    title: cleanPageTitle(g.title, host) || segs[segs.length - 1] || 'Untitled',
+    folder: cleanName(uploader || host || 'Other'),
+    channelName: uploader || '',
+    hasUploader: true, // (read from the page already; don't fetch it again)
+    duration: Number.isFinite(g.duration) ? Math.round(g.duration) : null,
+    thumbnail: g.thumbnail || null,
+    uploadDate: null,
+    heights: g.media.height ? [g.media.height] : [],
+    isLive: false,
+    viaPage: true,
+    direct: d
+  };
+}
+
+// Video files taken from a page are handed to the window as a ticket, never as file paths.
+const directTickets = new Map();
+function ticketFor(result) {
+  if (result && result.direct && typeof result.direct === 'object') {
+    const t = crypto.randomUUID();
+    directTickets.set(t, result.direct);
+    result.direct = t;
+  }
+  return result;
+}
+
+/** Look up one video; if its site refuses the engine even with a pass, go through the page window. */
+async function lookupVideo(url, opts = {}) {
+  const quiet = !!opts.private;
+  if (looksLikeVideo(url) && sites.needsWindow(url)) return grabVideo(url, { quiet, useVisible: opts.useVisible });
+  try {
+    return await prober.lookup(url, { include: opts.include, quiet, cookiesBrowser: S().cookiesBrowser, onLine: (l) => send('lookup:line', l) });
+  } catch (e) {
+    if (looksLikeVideo(url) && sites.hasPass(url) && sites.isBlocked(url, e.message)) {
+      log.info('The site refused the engine even with its pass: using the page window for its videos');
+      sites.markNeedsWindow(url);
+      return grabVideo(url, { quiet, useVisible: opts.useVisible });
+    }
+    throw e;
+  }
+}
+
+function logLookupFailure(e, opts) {
+  log.warn('Lookup failed: ' + (opts && opts.private ? '[private link]' : String(e && e.message || e).split('\n')[0].slice(0, 300)));
+}
+
 handle('lookup', async (url, opts = {}) => {
   try {
-    const result = await prober.lookup(url, { include: opts.include, quiet: !!opts.private, cookiesBrowser: S().cookiesBrowser, onLine: (l) => send('lookup:line', l) });
-    return decorate(result, opts);
+    const result = await lookupVideo(url, opts);
+    return ticketFor(await decorate(result, opts));
   } catch (e) {
-    if (sites.isBlocked(url, e.message)) throw new Error('Page scan: this site is protected by Cloudflare. Press "Open the page", tick the "I\'m human" box if it shows one, then press Scan now.');
+    logLookupFailure(e, opts);
+    if (sites.isBlocked(url, e.message) || isSiteCheck(e)) throw new Error(blockedMessage(e));
     if (!/Unsupported URL/i.test(e.message)) throw e;
+    // A single video the engine can't read: scanning its page would only collect the "related videos".
+    if (looksLikeVideo(url)) throw new Error('Slim Takes can\'t read videos on this site (the download engine doesn\'t support it). If it\'s from a channel or profile, try pasting that link instead.');
     return decorate(await scanList(url, { quiet: !!opts.private }), opts);
   }
 });
 handle('lookupList', async (url, opts = {}) => {
   try {
-    const result = await prober.lookupList(url, { include: opts.include, cookiesBrowser: S().cookiesBrowser, onLine: (l) => send('lookup:line', l) });
-    return decorate(result, opts);
+    // A single video link opens as that video, never as a list.
+    const result = looksLikeVideo(url)
+      ? await lookupVideo(url, opts)
+      : await prober.lookupList(url, { include: opts.include, cookiesBrowser: S().cookiesBrowser, onLine: (l) => send('lookup:line', l) });
+    return ticketFor(await decorate(result, opts));
   } catch (e) {
-    if (sites.isBlocked(url, e.message)) throw new Error('Page scan: this site is protected by Cloudflare. Press "Open the page", tick the "I\'m human" box if it shows one, then press Scan now.');
+    logLookupFailure(e, opts);
+    if (sites.isBlocked(url, e.message) || isSiteCheck(e)) throw new Error(blockedMessage(e));
     if (!/Unsupported URL/i.test(e.message)) throw e;
+    // A single video the engine can't read: scanning its page would only collect the "related videos".
+    if (looksLikeVideo(url)) throw new Error('Slim Takes can\'t read videos on this site (the download engine doesn\'t support it). If it\'s from a channel or profile, try pasting that link instead.');
     return decorate(await scanList(url, { quiet: !!opts.private }), opts);
   }
 });
 handle('pageScan', async (url, opts = {}) => decorate(await scanList(url, { quiet: !!opts.private }), opts));
 // Show-me mode: open the page for the user, then read whatever they're looking at.
-handle('pageScan:open', (url) => openVisible(url, win, { onLoop: () => { log.info('Page window: the site check keeps repeating'); send('pageScan:loop', url); } }));
+handle('pageScan:open', async (url) => { await ensureBrowserPass(url).catch(() => {}); return openVisible(url, win, { onLoop: () => { log.info('Page window: the site check keeps repeating'); send('pageScan:loop', url); } }); });
 // "Use my browser instead": borrow the site's pass from the user's own browser.
 handle('pageScan:useBrowser', async (url, browser) => {
   if (!/^https?:\/\//i.test(String(url)) || !BROWSERS.includes(browser)) throw new Error('Pick a browser first.');
@@ -379,11 +501,46 @@ handle('pageScan:useBrowser', async (url, browser) => {
   const { ua, target } = await browserIdentity(browser);
   sites.savePass(url, cookies, ua, { from: 'browser', target });
   await usePass(url, cookies, ua);
+  loadedPasses.add(hostOf(url));
   closeVisible();
   log.info(`Using ${BROWSER_LABEL[browser]}'s pass for this site`);
+  // A clean slate for the site: the engine gets another go, and held downloads carry on.
+  sites.clearNeedsWindow(url);
+  const resumed = queue.releaseSite(url);
+  if (resumed) log.info(`Carrying on with ${resumed} held download(s)`);
   return { ok: true, browser: BROWSER_LABEL[browser] };
 });
-handle('pageScan:visible', async (url, opts = {}) => decorate(await scanList(url, { quiet: !!opts.private, visible: true }), opts));
+handle('pageScan:visible', async (url, opts = {}) => {
+  if (!looksLikeVideo(url)) {
+    const r = await decorate(await scanList(url, { quiet: !!opts.private, visible: true }), opts);
+    queue.releaseSite(url); // got through: held downloads from this site carry on
+    return r;
+  }
+  // A single video behind the site check: keep the freshest pass, then look up just that video
+  // (through this same window if the site refuses the engine).
+  send('grab:status', 'Looking up the video…');
+  await keepFreshPass(url);
+  try {
+    const r = ticketFor(await decorate(await lookupVideo(url, { ...opts, useVisible: true }), opts));
+    queue.releaseSite(url);
+    return r;
+  } catch (e) {
+    logLookupFailure(e, opts);
+    if (isSiteCheck(e)) throw new Error(blockedMessage(e).replace(/^Page scan: /, ''));
+    throw e;
+  } finally {
+    closeVisible();
+  }
+});
+
+// If the page window just earned its own "I'm human" pass, it's the freshest: use it for downloads.
+// (Otherwise keep the one borrowed from the user's own browser.)
+async function keepFreshPass(url) {
+  try {
+    const { cookies, ua } = await siteCookies(url);
+    if (sites.passFrom(url) !== 'browser' || freshWindowPass(url, cookies)) sites.savePass(url, cookies, ua);
+  } catch (e) { log.warn('Could not save the site pass: ' + e.message); }
+}
 handle('pageScan:cancel', () => closeVisible());
 
 // Page scan: read the profile page directly, then check the videos can be downloaded, and use the
@@ -392,12 +549,11 @@ async function scanList(url, { quiet = false, visible = false } = {}) {
   log.info(visible ? 'Page scan (shown page)' : 'Page scan: the engine could not read this link, reading the page directly');
   send('grab:status', 'Reading the page directly…');
   const opts = { log, quiet, onProgress: (t) => send('grab:status', t) };
+  await ensureBrowserPass(url).catch(() => {});
   const scan = visible ? await scanVisible(url, opts) : await pageScan(url, opts);
   // If the site gave the window a Cloudflare "I'm human" pass, share it with the engine for this site.
-  // (A pass borrowed from the user's own browser is kept: it's tied to that browser.)
-  if (sites.passFrom(url) !== 'browser') {
-    try { const { cookies, ua } = await siteCookies(url); sites.savePass(url, cookies, ua); } catch (e) { log.warn('Could not save the site pass: ' + e.message); }
-  }
+  // (A pass borrowed from the user's own browser is kept, unless the window earned a fresher one.)
+  await keepFreshPass(url);
   if (!scan.groups.length) {
     const err = new Error('Page scan couldn\'t find any videos on that page. Try "Open the page": click past any popups yourself, then press Scan now.');
     err.noVideos = true;
@@ -405,7 +561,7 @@ async function scanList(url, { quiet = false, visible = false } = {}) {
   }
   // Let the engine decide which links are this creator's videos.
   const chosen = await chooseVideos(scan, url, {
-    lookup: (u) => prober.lookup(u, { cookiesBrowser: S().cookiesBrowser, quiet }),
+    lookup: (u) => lookupVideo(u, { private: quiet }),
     follow: (items) => followLinks(items, { log, onProgress: opts.onProgress }),
     log: quiet ? null : log,
     onProgress: opts.onProgress,
@@ -435,7 +591,11 @@ async function scanList(url, { quiet = false, visible = false } = {}) {
     };
   });
   const scanName = scan.name;
-  return { kind: 'list', scanned: true, url, title: creatorName || scanName || folder, channelName: creatorName, folder, site: first.site, extractor: first.extractor, thumbnail: null, entries };
+  // The site's check came back partway: say how far the list goes.
+  const note = scan.checkStoppedAt
+    ? `The site's "are you human" check came back on page ${scan.checkStoppedAt}${scan.lastPage ? ' of ' + scan.lastPage : ''}, so this list only has pages 1–${scan.checkStoppedAt - 1}. Press "Open the page" to get past it, then scan again for the rest (videos you already have are skipped).`
+    : null;
+  return { kind: 'list', scanned: true, url, title: creatorName || scanName || folder, channelName: creatorName, folder, site: first.site, extractor: first.extractor, thumbnail: null, entries, note };
 }
 
 // Mark what's already on disk and add size estimates.
@@ -470,8 +630,10 @@ async function decorate(result, opts) {
 }
 
 handle('queue:add', (specs) => {
-  const list = Array.isArray(specs) ? specs : [specs];
-  return queue.addMany(list.filter((x) => x && typeof x.url === 'string' && /^https?:\/\//i.test(x.url)));
+  const list = (Array.isArray(specs) ? specs : [specs]).filter((x) => x && typeof x.url === 'string' && /^https?:\/\//i.test(x.url));
+  // A video file found on its page comes back as a ticket; swap in the real details (never trust paths from the window).
+  for (const x of list) x.direct = typeof x.direct === 'string' ? (directTickets.get(x.direct) || null) : null;
+  return queue.addMany(list);
 });
 handle('queue:action', (action, id) => {
   const fns = { pause: 'pause', resume: 'resume', retry: 'retry', cancel: 'cancel', remove: 'remove' };
@@ -488,9 +650,11 @@ handle('history:get', () => history.all());
 handle('history:remove', (id) => history.remove(id));
 handle('history:clear', async () => {
   history.clear();
+  library.clearIds();
   log.clear();
   await session.defaultSession.clearCache().catch(() => {});
   await clearScanData();
+  loadedPasses.clear();
   sites.clearPasses();
   log.info('History, log and thumbnail cache cleared');
 });
@@ -647,7 +811,7 @@ app.on('before-quit', (e) => {
   e.preventDefault();
   queue.stopAllForQuit();
   folderSync.stop();
-  if (S().clearHistoryOnClose) { history.clear(); log.clear(); }
+  if (S().clearHistoryOnClose) { history.clear(); library.clearIds(); log.clear(); }
   settingsStore.saveNow();
   // Thumbnails the window showed (including private ones) are cached by the browser engine: wipe them.
   closeVisible();

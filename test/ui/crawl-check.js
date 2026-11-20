@@ -41,8 +41,18 @@ function gardenPage(p) {
 }
 const homePage = () => { homeHits.count++; return `<h1>Home</h1>${nav}<div class="list">${Array.from({ length: 20 }, (_, i) => `<div class="item"><a href="/video/${5000 + i}/x-${i}/"><img alt="x" src="/i/x.jpg"></a></div>`).join('')}</div><a class="next" href="/home/2/">Next</a>`; };
 
+const challenge = '<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-stage"></div></body></html>';
+const checkyTiles = (p) => Array.from({ length: PER }, (_, i) => 3000 + (p - 1) * PER + i).map((id) => `<div class="item"><a href="/video/${id}/c-${id}/"><img alt="C ${id}" src="/i/${id}.jpg"></a></div>`).join('');
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  const ck = u.pathname.match(/^\/channel\/checky\/(?:(\d+)\/)?$/);
+  if (ck) {
+    const p = Number(ck[1] || 1);
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    if (p >= 3) return res.end(challenge);
+    return res.end(`<!doctype html><html><head><title>Checky - Videos</title></head><body><h1>Checky</h1>${nav}<div class="list">${checkyTiles(p)}</div><a class="next" href="/channel/checky/${p + 1}/">Next</a></body></html>`);
+  }
+  if (u.pathname === '/channel/checkfirst/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(challenge); }
   const mm = u.pathname.match(/^\/channel\/garden\/(?:(\d+)\/)?$/);
   if (mm || /^\/home\//.test(u.pathname)) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -104,6 +114,17 @@ const server = http.createServer((req, res) => {
   assert.ok(lines2.some((l) => /nothing new, reloading it once/.test(l)), 'empty page reloaded');
   assert.ok(progress.some((t) => /page 3 of 5/.test(t)), 'progress shows the page count: ' + progress.join(' | '));
   assert.equal(homeHits.count, 1, 'went to the home page only once');
+
+  // ---- The site's "are you human" check comes back on page 3: keep pages 1-2 and say where it stopped.
+  const lines3 = [];
+  const res3 = await crawl(driver, `${base}/channel/checky/`, { log: { info: (m) => lines3.push(m), warn: () => {} }, politeMs: 20, scrolls: 1 });
+  const ids3 = res3.groups.flatMap((g) => g.items).map((v) => v.url).filter((u) => /\/video\//.test(u)).length;
+  assert.equal(res3.checkStoppedAt, 3, lines3.join('\n'));
+  assert.equal(ids3, 2 * PER, 'kept pages 1-2');
+  // ...and on page 1: a clear "protected" error (so the app offers Open the page)
+  let err;
+  try { await crawl(driver, `${base}/channel/checkfirst/`, { politeMs: 20, scrolls: 1 }); } catch (e) { err = e; }
+  assert.ok(err && err.siteCheck && /protected by Cloudflare/.test(err.message), String(err));
 
   await browser.close();
   server.close();

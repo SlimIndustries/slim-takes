@@ -6,6 +6,7 @@
 
 const { BrowserWindow, session } = require('electron');
 const { crawl, resolveLinks } = require('./crawl');
+const { CF_CHECK, mediaProbe, AGE_CLICK, pickMedia } = require('./scanlogic');
 
 const PAGE_TIMEOUT = 30000;
 const PARTITION = 'slimtakes-pagescan'; // separate from the app; not kept after quit
@@ -13,10 +14,8 @@ const PARTITION = 'slimtakes-pagescan'; // separate from the app; not kept after
 let prepared = false;
 let visibleWin = null;
 const borrowedUA = new Map(); // site -> the user's own browser identity, when its pass was borrowed
+const borrowedPass = new Map(); // site -> the "I'm human" cookie value borrowed from the user's browser
 
-// Is the page Cloudflare's "are you human" check?
-const CF_CHECK = String.raw`(() => !!(window._cf_chl_opt || /^just a moment/i.test(document.title) ||
-  document.querySelector('#challenge-form, #challenge-stage, #challenge-running, iframe[src*="challenges.cloudflare.com"]')))()`;
 const LOOP_LOADS = 3;        // the check came back this many times...
 const LOOP_MS = 45000;       // ...or has been on screen this long
 
@@ -133,6 +132,8 @@ async function usePass(url, cookies, ua) {
   const ses = scanSession();
   const host = hostOf(url);
   if (ua && host) borrowedUA.set(host, ua);
+  const cf = cookies.find((c) => /^cf_clearance$/i.test(c.name));
+  if (cf && host) borrowedPass.set(host, cf.value);
   for (const c of cookies) {
     const domain = String(c.domain || '');
     try {
@@ -192,11 +193,123 @@ async function siteCookies(url) {
   return { cookies, ua: ses.getUserAgent() };
 }
 
+/**
+ * Did the page window earn its own fresh "I'm human" pass for this site (rather than only
+ * carrying the one borrowed from the user's browser)? The freshest pass should win.
+ */
+function freshWindowPass(url, cookies) {
+  const cf = (cookies || []).find((c) => /^cf_clearance$/i.test(c.name));
+  if (!cf) return false;
+  return borrowedPass.get(hostOf(url)) !== cf.value;
+}
+
+// ---------- getting a video straight from its page ----------
+// For sites that refuse the download engine but let the page window in: open the video page in the
+// window, let its player start, and note the video file it asks for. One page at a time.
+let grabChain = Promise.resolve();
+
+function grabMedia(url, opts = {}) {
+  const run = () => doGrab(url, opts);
+  const p = grabChain.then(run, run);
+  grabChain = p.catch(() => {});
+  return p;
+}
+
+const MEDIA_TYPE = /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
+const MEDIA_URL = /\.(mp4|m4v|webm|mov|m3u8)(\?|$)/i;
+
+async function doGrab(url, { useVisible = false, log, timeoutMs = 20000 } = {}) {
+  const ses = scanSession();
+  let win = useVisible && visibleWin && !visibleWin.isDestroyed() ? visibleWin : null;
+  const own = !win;
+  if (own) win = makeWindow(false);
+  win.webContents.setAudioMuted(true);
+  const wcId = win.webContents.id;
+  const net = new Map();
+  const header = (h, name) => { for (const k of Object.keys(h || {})) if (k.toLowerCase() === name) return [].concat(h[k])[0]; return ''; };
+  ses.webRequest.onResponseStarted({ urls: ['http://*/*', 'https://*/*'] }, (d) => {
+    if (d.webContentsId != null && d.webContentsId !== wcId) return;
+    const type = String(header(d.responseHeaders, 'content-type'));
+    if (MEDIA_TYPE.test(type) || MEDIA_URL.test(d.url)) net.set(d.url, { url: d.url, type, len: Number(header(d.responseHeaders, 'content-length')) || 0 });
+  });
+  try {
+    const alive = () => { if (win.isDestroyed()) throw new Error('The page window was closed.'); };
+    const js = (code) => { alive(); return win.webContents.executeJavaScript(code, true); };
+    const here = () => (win.isDestroyed() ? '' : win.webContents.getURL());
+    // Run the video finder in the page and in every frame inside it (many players live in a frame).
+    const probeAll = async (click) => {
+      alive();
+      const code = mediaProbe(click);
+      const main = await win.webContents.executeJavaScript(code, true).catch(() => null);
+      const out = main ? [...main.out] : [];
+      let duration = main && main.duration;
+      let frames = [];
+      try { frames = win.webContents.mainFrame.framesInSubtree.filter((f) => f !== win.webContents.mainFrame); } catch { /* ignore */ }
+      for (const f of frames.slice(0, 12)) {
+        const r = await Promise.race([f.executeJavaScript(code, true).catch(() => null), wait(4000).then(() => null)]);
+        if (r) { out.push(...r.out); if (!duration && r.duration) duration = r.duration; }
+      }
+      return main ? { ...main, out, duration } : (out.length ? { out, duration, title: '', thumb: null, at: url, ua: null } : null);
+    };
+    if (!sameAddress(here(), url)) await load(win, url);
+    // Some checks clear themselves in a few seconds: wait a little before giving up.
+    const checkUntil = Date.now() + 8000;
+    while (await js(CF_CHECK).catch(() => false) && Date.now() < checkUntil) await settle(win, 2000);
+    if (await js(CF_CHECK).catch(() => false)) {
+      const e = new Error('The site\'s "are you human" check came up. Use Open the page (or your normal browser) to get past it, then try again.');
+      e.siteCheck = true;
+      throw e;
+    }
+    // Click past an age popup if there is one; if that leaves the page, come straight back.
+    if (await js(AGE_CLICK).catch(() => null)) {
+      await settle(win, 2500);
+      if (!sameAddress(here(), url)) await load(win, url);
+    }
+    let found = null, info = null, click = true, wanderedOff = 0;
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      info = (await probeAll(click)) || info;
+      // Pressing play opened an ad page instead? Go back, and stop pressing play.
+      if (!sameAddress(here(), url)) {
+        wanderedOff++;
+        click = false;
+        if (log) log.info('Page window: pressing play went to another page, going back');
+        if (wanderedOff > 2) break;
+        await load(win, url);
+        continue;
+      }
+      found = pickMedia(info ? info.out : [], [...net.values()]);
+      if (found && (found.height || found.hls || Date.now() - started > 6000)) break;
+      await wait(1500);
+    }
+    if (!found) throw new Error('Couldn\'t find the video on that page.');
+    info = info || {};
+    if (log) log.info(`Got the video from the page (${found.hls ? 'stream' : 'file'}${found.height ? ', ' + found.height + 'p' : ''})`);
+    const html = await js('document.documentElement.outerHTML').catch(() => '');
+    // Cookies for the site and for wherever the video file lives.
+    const hosts = [hostOf(url), hostOf(found.url)].filter(Boolean);
+    const all = await ses.cookies.get({});
+    const cookies = all.filter((c) => { const d = String(c.domain || '').replace(/^\./, '').replace(/^www\./, ''); return hosts.some((h) => d === h || h.endsWith('.' + d) || d.endsWith('.' + h)); });
+    return { media: found, title: info.title, thumbnail: info.thumb, duration: info.duration, at: url, ua: info.ua || win.webContents.getUserAgent() || ses.getUserAgent(), html, cookies };
+  } finally {
+    ses.webRequest.onResponseStarted(null);
+    if (own && !win.isDestroyed()) win.destroy();
+  }
+}
+
+function sameAddress(a, b) {
+  try {
+    const x = new URL(a), y = new URL(b);
+    return x.host.replace(/^www\./, '') === y.host.replace(/^www\./, '') && x.pathname.replace(/\/+$/, '') === y.pathname.replace(/\/+$/, '');
+  } catch { return false; }
+}
+
 /** Forget everything the scan windows stored (cookies from clicking popups, cache). */
 async function clearScanData() {
   const ses = session.fromPartition(PARTITION);
   borrowedUA.clear();
+  borrowedPass.clear();
   await Promise.all([ses.clearStorageData().catch(() => {}), ses.clearCache().catch(() => {})]);
 }
 
-module.exports = { pageScan, openVisible, scanVisible, closeVisible, clearScanData, followLinks, fetchPage, siteCookies, usePass, isScanningVisible, CF_CHECK };
+module.exports = { pageScan, openVisible, scanVisible, closeVisible, clearScanData, followLinks, fetchPage, siteCookies, usePass, isScanningVisible, freshWindowPass, grabMedia, CF_CHECK };

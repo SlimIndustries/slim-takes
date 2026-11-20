@@ -94,10 +94,12 @@ test('library: archive IDs, reservations and folder scan', async () => {
   assert.equal(b.base, 'Jimmy Cuts Grass (2)');
   const c = await lib.claim({ dir, title: 'Jimmy Cuts Grass', duration: 400, ext: 'mp4' });
   assert.equal(c.base, 'Jimmy Cuts Grass (3)', 'reserved names must not be reused');
-  lib.addId('Youtube', 'abc');
+  lib.addId('Youtube', 'abc', path.join(dir, 'Jimmy Cuts Grass.mp4'));
   assert.ok(lib.hasId('youtube', 'abc'));
   const lib2 = new Library({ storeFile: path.join(tmp, 'lib.json'), probeDuration: async () => null });
   assert.ok(lib2.hasId('Youtube', 'abc'), 'archive persists');
+  lib2.addId('Youtube', 'nofile');
+  assert.ok(!lib2.hasId('Youtube', 'nofile'), 'an ID is only kept with the file it was saved as');
   assert.equal(lib2.status(dir, 'Jimmy Cuts Grass', 768), 'have');
   assert.equal(lib2.status(dir, 'Jimmy Cuts Grass', 100), 'sametitle');
   assert.equal(lib2.status(dir, 'Leaf Blower', 100), 'new');
@@ -296,7 +298,7 @@ test('rename: old data folder and SlimTake save folder move over, paths updated'
   fs.writeFileSync(path.join(oldData, 'engine', 'yt-dlp.exe'), 'bin');
   fs.writeFileSync(path.join(oldData, 'settings.json'), JSON.stringify({ folder: saveOld, theme: 'ice' }));
   fs.writeFileSync(path.join(oldData, 'history.json'), JSON.stringify([{ id: 1, filePath: path.join(saveOld, 'Jimmy', 'a.mp4') }, { id: 2, filePath: path.join(root, 'Elsewhere', 'b.mp4') }]));
-  fs.writeFileSync(path.join(oldData, 'library.json'), JSON.stringify({ cache: { [path.join(saveOld, 'Jimmy')]: { 'a.mp4': { duration: 5 } } }, archive: ['youtube x'] }));
+  fs.writeFileSync(path.join(oldData, 'library.json'), JSON.stringify({ cache: { [path.join(saveOld, 'Jimmy')]: { 'a.mp4': { duration: 5 } } }, files: { 'youtube x': path.join(saveOld, 'Jimmy', 'a.mp4') } }));
 
   assert.equal(migrate.moveDataFolder(oldData, newData), true);
   assert.ok(fs.existsSync(path.join(newData, 'engine', 'yt-dlp.exe')), 'engine came along');
@@ -311,7 +313,7 @@ test('rename: old data folder and SlimTake save folder move over, paths updated'
   assert.equal(h[1].filePath, path.join(root, 'Elsewhere', 'b.mp4'), 'files elsewhere untouched');
   const lib = JSON.parse(fs.readFileSync(path.join(newData, 'library.json'), 'utf8'));
   assert.ok(lib.cache[path.join(saveNew, 'Jimmy')]);
-  assert.deepEqual(lib.archive, ['youtube x']);
+  assert.deepEqual(lib.files, { 'youtube x': path.join(saveNew, 'Jimmy', 'a.mp4') }, 'saved file locations follow the rename');
   assert.equal(migrate.renameSaveFolder(newData), false, 'only once');
   assert.equal(migrate.swapPrefix('C:\\V\\SlimTake\\x.mp4', 'c:\\v\\slimtake', 'C:\\V\\SlimTakes'.replace(/\\/g, path.sep)), 'C:\\V\\SlimTake\\x.mp4'.startsWith('C:') && path.sep === '\\' ? 'C:\\V\\SlimTakes\\x.mp4' : 'C:\\V\\SlimTake\\x.mp4');
 });
@@ -432,4 +434,74 @@ test('page scan: groups are kept when no uploader name can be found anywhere (re
     { shape: '/b-*/*', score: 8, items: items('b', 5, '') }
   ] }, 'https://e.com/maker/roberta_ruiva', { lookup, uploaderOf, follow: async (x) => x });
   assert.equal(r.videos.length, 10);
+});
+
+
+test('deleted after clearing history: the video can be downloaded again (the reported bug)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'st-'));
+  const dir = path.join(tmp, 'Jimmy');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, 'Jimmy Cuts Grass.mp4');
+  fs.writeFileSync(file, 'x');
+  const store = path.join(tmp, 'lib.json');
+  const lib = new Library({ storeFile: store, probeDuration: async () => 768 });
+  lib.addId('Generic', 'v1', file);
+  lib.noteFile(file, 768);
+  assert.equal(lib.status(dir, 'Jimmy Cuts Grass', 768, 'Generic', 'v1'), 'have');
+  // History cleared (nothing links the file any more), then the file deleted, even with the app closed
+  fs.rmSync(file);
+  const lib2 = new Library({ storeFile: store, probeDuration: async () => null });
+  assert.equal(lib2.hasId('Generic', 'v1'), false, 'the ID is free again');
+  assert.equal(lib2.status(dir, 'Jimmy Cuts Grass', 768, 'Generic', 'v1'), 'new', 'and title/length no longer match a deleted file');
+});
+
+test('old ID lists without file locations are dropped once (unsticks "already have it")', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'st-'));
+  const store = path.join(tmp, 'lib.json');
+  fs.writeFileSync(store, JSON.stringify({ cache: {}, archive: ['generic stuck1', 'youtube stuck2'] }));
+  const lib = new Library({ storeFile: store, probeDuration: async () => null });
+  assert.equal(lib.hasId('Generic', 'stuck1'), false);
+  assert.equal(lib.hasId('Youtube', 'stuck2'), false);
+});
+
+test('clear history forgets downloaded IDs; files on disk still count as duplicates', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'st-'));
+  const dir = path.join(tmp, 'Jimmy');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, 'Jimmy Cuts Grass.mp4');
+  fs.writeFileSync(file, 'x');
+  const lib = new Library({ storeFile: path.join(tmp, 'lib.json'), probeDuration: async () => 768 });
+  lib.addId('Youtube', 'abc', file);
+  lib.clearIds();
+  assert.equal(lib.hasId('Youtube', 'abc'), false);
+  const again = await lib.claim({ dir, title: 'Jimmy Cuts Grass', duration: 768, ext: 'mp4' });
+  assert.equal(again.skip, true, 'still on disk: still skipped as a duplicate');
+});
+
+test('single video links are told apart from channels and playlists', () => {
+  const { looksLikeVideo } = require('../src/main/urls');
+  const yes = ['https://www.youtube.com/watch?v=abc&list=PL1', 'https://youtu.be/abc', 'https://vimeo.com/123456789', 'https://x.com/someone/status/1',
+    'https://www.tiktok.com/@a/video/1', 'https://example.com/video/198308/some-title/', 'https://www.twitch.tv/videos/12345'];
+  const no = ['https://www.youtube.com/@jimmy', 'https://www.youtube.com/playlist?list=PL1', 'https://vimeo.com/someone', 'https://example.com/channel/some-collection/',
+    'https://example.com/videos/category-name/', 'https://www.instagram.com/someone/', 'https://soundcloud.com/artist'];
+  for (const u of yes) assert.ok(looksLikeVideo(u), u);
+  for (const u of no) assert.ok(!looksLikeVideo(u), u);
+});
+
+test('page window: picks the real video file, not ads, previews or stream pieces', () => {
+  const { pickMedia, cleanPageTitle, heightOf } = require('../src/main/scanlogic');
+  const best = pickMedia([
+    { url: 'https://cdn.example.net/ads/preroll.mp4', from: 'script' },
+    { url: 'https://cdn.example.net/v/123_480p.mp4', label: '480p', from: 'source' },
+    { url: 'https://cdn.example.net/v/123_1080p.mp4', label: '1080p', from: 'source' },
+    { url: 'https://cdn.example.net/previews/123.mp4', from: 'script' }
+  ], [{ url: 'https://cdn.example.net/hls/123/seg-1.ts' }, { url: 'https://cdn.example.net/v/tiny.mp4', len: 4000 }]);
+  assert.equal(best.url, 'https://cdn.example.net/v/123_1080p.mp4');
+  assert.equal(best.height, 1080);
+  const hls = pickMedia([], [{ url: 'https://cdn.example.net/hls/123/master.m3u8', type: 'application/vnd.apple.mpegurl' }]);
+  assert.ok(hls.hls);
+  assert.equal(pickMedia([{ url: 'blob:https://x/1' }], []), null);
+  assert.equal(cleanPageTitle('Jimmy Cuts Grass - Example Videos | Example.com', 'www.example.com'), 'Jimmy Cuts Grass');
+  assert.equal(cleanPageTitle('Jimmy Cuts Grass', 'example.com'), 'Jimmy Cuts Grass');
+  assert.equal(heightOf('video_720p.mp4'), 720);
 });

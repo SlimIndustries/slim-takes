@@ -44,7 +44,7 @@ const MOCK = fs.readFileSync(path.join(__dirname, 'mock-api.js'), 'utf8');
   assert.deepEqual(errors, []);
   // the Cloudflare check detector
   const p2 = await browser.newPage();
-  const { CF_CHECK } = { CF_CHECK: require('fs').readFileSync(path.resolve(__dirname, '../../src/main/pagescan.js'), 'utf8').match(/CF_CHECK = String\.raw`([\s\S]*?)`;/)[1] };
+  const { CF_CHECK } = require('../../src/main/scanlogic');
   await p2.setContent('<title>Just a moment...</title><div id="challenge-stage"></div>');
   assert.equal(await p2.evaluate(CF_CHECK), true);
   await p2.setContent('<title>Someone - Videos</title><a href="/v/1">video</a>');

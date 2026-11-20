@@ -48,6 +48,12 @@ if (args.includes('-J')) {
       entries: [{ _type: 'url', id: 'a1', url: 'https://www.example.com/video/a1' }, { _type: 'url', id: 'a2', url: 'https://www.example.com/video/a2' }] }));
     process.exit(0);
   }
+  if (/oneembed/.test(url)) {
+    // A video page whose player comes back as a "list of one".
+    console.log(JSON.stringify({ _type: 'playlist', id: 'page', extractor_key: 'Generic',
+      entries: [{ _type: 'url', id: 'a7', url: 'https://www.example.com/video/a7' }] }));
+    process.exit(0);
+  }
   if (/\/video\/a\d/.test(url)) {
     console.log(JSON.stringify({ id: url.slice(-2), title: 'Clip ' + url.slice(-2), uploader: 'Some Creator', extractor_key: 'SomeSite', duration: 90, webpage_url: url, formats: [{ height: 720 }] }));
     process.exit(0);
@@ -73,6 +79,12 @@ if (args.includes('-J')) {
 
 const out = get('-o');
 if (!out) { console.error('ERROR: no output'); process.exit(2); }
+
+// A site that refuses the engine for its pages (even with a pass), but whose video files download
+// fine when asked for like the page's player does (with the page as referer).
+if (/pagewin-site\.net/.test(url)) { console.error('ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)'); process.exit(1); }
+if (/needsreferer/.test(url) && !get('--referer')) { console.error('ERROR: unable to download video data: HTTP Error 403: Forbidden'); process.exit(1); }
+if (/expiredlink/.test(url)) { console.error('ERROR: unable to download video data: HTTP Error 410: Gone'); process.exit(1); }
 
 const id = (url.match(/v=([^&]+)/) || [, 'x'])[1];
 if (/fail/.test(url)) { console.error('ERROR: [youtube] ' + id + ': Video unavailable'); process.exit(1); }

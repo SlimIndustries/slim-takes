@@ -440,3 +440,164 @@ test('Cancel all: stops downloads, removes everything unfinished, keeps finished
   await new Promise((r) => setTimeout(r, 600));
   assert.equal(s.queue.list().length, 1, 'nothing new started afterwards');
 });
+
+test('a video page that comes back as a "list of one" is treated as that video', async () => {
+  const s = setup();
+  const prober = new Prober({ engine: s.engine, log: s.log });
+  const r = await prober.lookup('https://www.example.com/video/123/oneembed-clip/');
+  assert.equal(r.kind, 'video');
+  assert.equal(r.title, 'Clip a7');
+  // a channel with one video is still a channel
+  const list = await prober.lookup('https://www.example.com/channel/oneembed-channel/');
+  assert.equal(list.kind, 'list');
+});
+
+test('download, clear history, delete the file, paste it again: it downloads again', async () => {
+  const s = setup();
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=again1', title: 'Again', folder: 'A', extractor: 'Youtube', videoId: 'again1' });
+  let list = await waitFor(s.queue, (l) => l[0].status === 'done');
+  const file = list[0].filePath;
+  assert.ok(fs.existsSync(file));
+  s.queue.clearFinished();      // nothing in the lists links to the file any more
+  fs.rmSync(file);
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=again1', title: 'Again', folder: 'A', extractor: 'Youtube', videoId: 'again1' });
+  list = await waitFor(s.queue, (l) => ['done', 'skipped', 'failed'].includes(l[0].status));
+  assert.equal(list[0].status, 'done', JSON.stringify(list[0]));
+});
+
+// ---------- sites that refuse the engine: videos come through the page window ----------
+function pageWinSite(s, mediaUrls) {
+  const sites = withSites(s);
+  const page = 'https://pagewin-site.net/video/5338/some-clip-1711dd71/';
+  sites.update('pagewin-site.net', { impersonate: true });
+  sites.savePass(page, [{ name: 'cf_clearance', value: 'ok', domain: '.pagewin-site.net', path: '/' }], 'UA');
+  const calls = [];
+  s.queue.resolveDirect = async (url) => {
+    calls.push(url);
+    const mediaUrl = mediaUrls[Math.min(calls.length - 1, mediaUrls.length - 1)];
+    return { mediaUrl, referer: url, ua: 'Mozilla/5.0 Chrome/142', cookieFile: sites.writeDirectCookies(url, [{ name: 'cf_clearance', value: 'ok', domain: '.pagewin-site.net', path: '/' }]) };
+  };
+  return { sites, page, calls };
+}
+
+test('site refuses the engine: the download comes through the page window, and later ones skip the engine', async () => {
+  const s = setup();
+  const { sites, page, calls } = pageWinSite(s, ['https://cdn.pagewin-media.net/v/abc_720p.mp4?needsreferer=1']);
+  s.queue.add({ url: page, title: 'Some Clip', folder: 'Garden Collection', extractor: 'Generic', videoId: 'some-clip-1711dd71' });
+  let list = await waitFor(s.queue, (l) => ['done', 'failed'].includes(l[0].status));
+  assert.equal(list[0].status, 'done', JSON.stringify(list[0]));
+  assert.equal(calls.length, 1);
+  assert.ok(sites.needsWindow(page), 'remembered for the site');
+  assert.ok(s.library.hasId('Generic', 'some-clip-1711dd71'), 'counted under the video page\'s ID, not the file\'s');
+  // the next video from that site goes straight to the page window
+  s.queue.add({ url: 'https://pagewin-site.net/video/77/another/', title: 'Another', folder: 'Garden Collection', extractor: 'Generic', videoId: 'another' });
+  list = await waitFor(s.queue, (l) => l.length === 2 && ['done', 'failed'].includes(l.find((x) => x.title === 'Another').status));
+  assert.equal(list.find((x) => x.title === 'Another').status, 'done');
+  assert.equal(calls.length, 2);
+});
+
+test('page window video link expired: gets a fresh one once, then says so plainly', async () => {
+  const s = setup();
+  const { page, calls } = pageWinSite(s, ['https://cdn.pagewin-media.net/v/expiredlink.mp4', 'https://cdn.pagewin-media.net/v/good_720p.mp4?needsreferer=1']);
+  s.queue.add({ url: page, title: 'Expiring', folder: 'G', extractor: 'Generic', videoId: 'exp' });
+  let list = await waitFor(s.queue, (l) => ['done', 'failed'].includes(l[0].status));
+  assert.equal(list[0].status, 'done', JSON.stringify(list[0]));
+  assert.equal(calls.length, 2, 'fresh link fetched once');
+
+  const s2 = setup();
+  const p2 = pageWinSite(s2, ['https://cdn.pagewin-media.net/v/expiredlink.mp4']);
+  s2.queue.add({ url: p2.page, title: 'Always Expired', folder: 'G', extractor: 'Generic', videoId: 'exp2' });
+  list = await waitFor(s2.queue, (l) => ['done', 'failed', 'paused'].includes(l[0].status));
+  assert.equal(list[0].status, 'paused', 'held for a fresh pass instead of failing');
+  assert.ok(list[0].heldForPass);
+  assert.match(list[0].error, /refused the video file too/i);
+});
+
+test('a video file from the page can\'t point the engine at files outside the app\'s own folder', () => {
+  const s = setup();
+  const sites = withSites(s);
+  const args = sites.directArgs({ mediaUrl: 'https://cdn.x.net/v.mp4', referer: 'https://x.net/video/1', ua: 'UA', cookieFile: '/etc/passwd' });
+  assert.ok(!args.includes('--cookies'), 'cookie files outside the app folder are ignored');
+  assert.deepEqual(args.slice(0, 4), ['--referer', 'https://x.net/video/1', '--user-agent', 'UA']);
+});
+
+
+test('waiting for the page window doesn\'t take a download slot: other sites keep going', async () => {
+  const s = setup({ concurrent: 1 });
+  const { sites, calls } = pageWinSite(s, ['https://cdn.pagewin-media.net/v/a_720p.mp4?needsreferer=1']);
+  sites.markNeedsWindow('https://pagewin-site.net/');
+  const slow = s.queue.resolveDirect;
+  s.queue.resolveDirect = async (url, o) => { await new Promise((r) => setTimeout(r, 700)); return slow(url, o); };
+  s.queue.add({ url: 'https://pagewin-site.net/video/1/one/', title: 'One', folder: 'G', extractor: 'Generic' });
+  s.queue.add({ url: 'https://pagewin-site.net/video/2/two/', title: 'Two', folder: 'G', extractor: 'Generic' });
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=meanwhile', title: 'Meanwhile', folder: 'Y', extractor: 'Youtube' });
+  const order = [];
+  s.queue.on('item', (it) => { if (it.status === 'done' && !order.includes(it.title)) order.push(it.title); });
+  await waitFor(s.queue, (l) => l.length === 3 && l.every((x) => x.status === 'done'));
+  assert.equal(order[0], 'Meanwhile', 'the other site didn\'t wait behind the page window: ' + order);
+  assert.equal(calls.length, 2);
+});
+
+test('site check comes back: that site\'s downloads are held (one notice), then carry on after a fresh pass', async () => {
+  const s = setup();
+  const { calls } = pageWinSite(s, ['https://cdn.pagewin-media.net/v/a_720p.mp4?needsreferer=1']);
+  const good = s.queue.resolveDirect;
+  let refuse = true;
+  s.queue.resolveDirect = async (url, o) => {
+    if (refuse) { const e = new Error('The site\'s "are you human" check came up.'); e.siteCheck = true; throw e; }
+    return good(url, o);
+  };
+  const notices = [];
+  s.queue.on('needsPass', (n) => notices.push(n));
+  for (let i = 1; i <= 3; i++) s.queue.add({ url: `https://pagewin-site.net/video/${i}/clip-${i}/`, title: 'Clip ' + i, folder: 'G', extractor: 'Generic' });
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=other', title: 'Other site', folder: 'Y', extractor: 'Youtube' });
+  let list = await waitFor(s.queue, (l) => l.filter((x) => x.heldForPass).length === 3 && l.find((x) => x.title === 'Other site').status === 'done');
+  await new Promise((r) => setTimeout(r, 3500));
+  assert.equal(notices.length, 1, 'told once, not three times');
+  assert.equal(notices[0].count, 3);
+  assert.ok(list.filter((x) => x.heldForPass).every((x) => x.status === 'paused' && /fresh pass/.test(x.note)));
+  // the user gets a fresh pass
+  refuse = false;
+  assert.equal(s.queue.releaseSite('https://pagewin-site.net/anything'), 3);
+  list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'done'));
+  assert.ok(calls.length >= 3);
+});
+
+test('engine refused and no page-window route left: held, not failed; Retry really retries', async () => {
+  const s = setup();
+  const sites = withSites(s);
+  s.queue.resolveDirect = async () => { throw new Error('Couldn\'t find the video on that page.'); };
+  // no pass at all: blocked -> held straight away
+  s.queue.add({ url: 'https://cfbare-site.net/watch?v=h1', title: 'Held', folder: 'CF', extractor: 'Generic' });
+  let list = await waitFor(s.queue, (l) => l[0].status === 'paused' || l[0].status === 'failed');
+  assert.equal(list[0].status, 'paused');
+  assert.ok(list[0].heldForPass);
+  // pass arrives; Retry goes through normally
+  sites.savePass('https://cfbare-site.net/', [{ name: 'cf_clearance', value: 'ok', domain: '.cfbare-site.net', path: '/' }], 'UA');
+  s.queue.retry(list[0].id);
+  list = await waitFor(s.queue, (l) => l[0].status === 'done' || l[0].status === 'paused' || l[0].status === 'failed');
+  assert.equal(list[0].status, 'done', JSON.stringify(list[0]));
+});
+
+test('page window can\'t find the video: the engine gets one go instead', async () => {
+  const s = setup();
+  const sites = withSites(s);
+  sites.markNeedsWindow('https://www.youtube.com/');
+  let calls = 0;
+  s.queue.resolveDirect = async () => { calls++; throw new Error('Couldn\'t find the video on that page.'); };
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=fallback1', title: 'Fallback', folder: 'Y', extractor: 'Youtube' });
+  const list = await waitFor(s.queue, (l) => ['done', 'failed', 'paused'].includes(l[0].status));
+  assert.equal(list[0].status, 'done');
+  assert.equal(calls, 1);
+});
+
+test('a video link from the page that has gone stale is refreshed before downloading', async () => {
+  const s = setup();
+  const { calls, sites } = pageWinSite(s, ['https://cdn.pagewin-media.net/v/fresh_720p.mp4?needsreferer=1']);
+  const old = { mediaUrl: 'https://cdn.pagewin-media.net/v/old.mp4?needsreferer=1', referer: 'https://pagewin-site.net/video/9/x/', ua: 'UA', cookieFile: null, at: Date.now() - 2 * 3600 * 1000 };
+  s.queue.add({ url: 'https://pagewin-site.net/video/9/x/', title: 'Stale', folder: 'G', extractor: 'Generic', direct: old });
+  const list = await waitFor(s.queue, (l) => ['done', 'failed', 'paused'].includes(l[0].status));
+  assert.equal(list[0].status, 'done');
+  assert.equal(calls.length, 1, 'fetched a fresh link first');
+  assert.ok(sites);
+});

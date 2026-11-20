@@ -3,7 +3,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (ch, ...a) => ipcRenderer.invoke(ch, ...a);
-const EVENTS = ['queue:item', 'queue:list', 'queue:state', 'queue:idle', 'queue:diskLow', 'engine:step', 'watch:changed',
+const EVENTS = ['queue:item', 'queue:list', 'queue:state', 'queue:idle', 'queue:diskLow', 'queue:needsPass', 'engine:step', 'watch:changed',
   'history:changed', 'log:line', 'clipboard:links', 'app:update', 'lookup:line', 'grab:status', 'pageScan:loop'];
 
 contextBridge.exposeInMainWorld('slim', {

@@ -59,6 +59,7 @@ function renameSaveFolder(dataDir, log) {
     const cache = {};
     for (const [k, v] of Object.entries(lib.cache)) cache[swapPrefix(k, oldRoot, newRoot)] = v;
     lib.cache = cache;
+    if (lib.files) for (const k of Object.keys(lib.files)) lib.files[k] = swapPrefix(lib.files[k], oldRoot, newRoot);
     writeJson(path.join(dataDir, 'library.json'), lib);
   }
   if (log) log.info('Save folder renamed to SlimTakes');

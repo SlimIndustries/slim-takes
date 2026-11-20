@@ -125,12 +125,59 @@ class Sites {
     const all = this.store.get();
     for (const s of Object.values(all)) {
       if (s.pass && s.pass.file) { try { fs.rmSync(s.pass.file, { force: true }); } catch { /* ignore */ } }
+      if (s.direct) { try { fs.rmSync(s.direct, { force: true }); } catch { /* ignore */ } }
       delete s.pass;
+      delete s.direct;
+      delete s.needsWindow;
     }
     this.store.set(all);
+  }
+
+  /** This site refuses the engine even with a pass: get its videos through the page window instead. */
+  // (Forgotten after a few hours, so the faster engine gets another go; nothing is held against a site.)
+  needsWindow(url) {
+    const s = this.get(hostOf(url));
+    return !!(s && s.needsWindow && Date.now() - (s.needsWindowAt || 0) < NEEDS_WINDOW_MS);
+  }
+
+  markNeedsWindow(url) {
+    const host = hostOf(url);
+    if (host && !this.needsWindow(url)) this.update(host, { needsWindow: true, needsWindowAt: Date.now() });
+  }
+
+  /** A clean slate for a site (after the user gets a fresh pass). */
+  clearNeedsWindow(url) {
+    const host = hostOf(url);
+    const s = host && this.get(host);
+    if (s && s.needsWindow) this.update(host, { needsWindow: false, needsWindowAt: 0 });
+  }
+
+  /** Save the page window's cookies for downloading a video file straight from a site. */
+  writeDirectCookies(url, cookies) {
+    const host = hostOf(url);
+    if (!host || !cookies || !cookies.length) return null;
+    fs.mkdirSync(this.dir, { recursive: true });
+    const file = path.join(this.dir, host.replace(/[^a-z0-9.-]/gi, '_') + '.direct.txt');
+    fs.writeFileSync(file, toCookieFile(cookies), { mode: 0o600 });
+    this.update(host, { direct: file });
+    return file;
+  }
+
+  /** Engine options for downloading a video file found on a page (sent like the page window would). */
+  directArgs(direct) {
+    const args = [];
+    if (!direct) return args;
+    if (direct.referer) args.push('--referer', direct.referer);
+    if (direct.ua) args.push('--user-agent', direct.ua);
+    if (direct.cookieFile && direct.cookieFile.startsWith(this.dir) && fs.existsSync(direct.cookieFile)) args.push('--cookies', direct.cookieFile);
+    const s = this.get(hostOf(direct.mediaUrl)) || this.get(hostOf(direct.referer));
+    if (s && s.impersonate && !s.impersonateUnavailable) args.push('--impersonate', /Firefox\//.test(direct.ua || '') ? 'firefox' : 'chrome');
+    return args;
   }
 }
 
 const isCloudflare = (msg) => CLOUDFLARE.test(String(msg || ''));
+
+const NEEDS_WINDOW_MS = 6 * 3600 * 1000;
 
 module.exports = { Sites, hostOf, toCookieFile, isCloudflare };

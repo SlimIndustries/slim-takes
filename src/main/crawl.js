@@ -4,7 +4,7 @@
 //
 // driver = { load(url), js(code), settle(ms) }
 
-const { candidateGroups, nameFromUrl, summarise, COLLECT, AGE_CLICK, CLICK_NEXT } = require('./scanlogic');
+const { candidateGroups, nameFromUrl, summarise, COLLECT, AGE_CLICK, CLICK_NEXT, CF_CHECK } = require('./scanlogic');
 
 const countLinks = (all, url) => candidateGroups(all, url).reduce((n, g) => n + g.items.length, 0);
 const { cleanName } = require('./naming');
@@ -63,6 +63,16 @@ function pageLinks(res, startUrl) {
   });
 }
 
+// Is the site's "are you human" check on screen? Some clear themselves in a few seconds, so wait a little first.
+async function stillChecking(driver, waitMs = 8000) {
+  const until = Date.now() + waitMs;
+  while (await driver.js(CF_CHECK).catch(() => false)) {
+    if (Date.now() > until) return true;
+    await driver.settle(2000);
+  }
+  return false;
+}
+
 async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = false, politeMs = 1200, scrolls = 4, maxPages = MAX_PAGES } = {}) {
   const all = [];
   let name = '';
@@ -73,6 +83,7 @@ async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = f
   let lastPage = 0;      // highest page number the site shows
   let empties = 0;       // pages in a row that added nothing
   let siteNum = null;    // the site's own number for the page just read
+  let checkStoppedAt = null; // page where the site's check came back, if it did
   for (let page = 1; page <= maxPages; page++) {
     const of = lastPage > page ? ` of ${lastPage}` : '';
     if (onProgress) onProgress(`Reading the page directly… page ${page}${of}`);
@@ -80,6 +91,13 @@ async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = f
       if (!nextUrl || visited.has(nextUrl)) break;
       visited.add(nextUrl);
       if (!(firstLoaded && page === 1)) await driver.load(nextUrl);
+    }
+    // The site's "are you human" check came back: keep what we have so far and say where it stopped.
+    if (await stillChecking(driver)) {
+      if (log) log.info(`Page scan: the site's "are you human" check came up on page ${page}`);
+      if (page === 1) { const e = new Error('Page scan: this site is protected by Cloudflare. Press "Open the page", tick the "I\'m human" box if it shows one, then press Scan now.'); e.siteCheck = true; throw e; }
+      checkStoppedAt = page;
+      break;
     }
     let res = await readPage(driver, { log, quiet, scrolls, state });
     if (log && !quiet) log.info(`Page scan page ${page} address: ${res.at}`);
@@ -120,7 +138,7 @@ async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = f
   }
   const groups = candidateGroups(all, startUrl);
   if (log && !quiet) log.info('Page scan link groups: ' + (groups.slice(0, 10).map((g) => `${g.shape} (${g.items.length})`).join(', ') || 'none'));
-  return { groups, name: cleanName(name || nameFromUrl(startUrl) || '', null) };
+  return { groups, name: cleanName(name || nameFromUrl(startUrl) || '', null), checkStoppedAt, lastPage };
 }
 
 // ---------- tracking links ----------

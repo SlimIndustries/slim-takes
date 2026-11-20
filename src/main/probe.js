@@ -4,7 +4,7 @@
 const { run } = require('./util');
 const { creatorFolderName, cleanName } = require('./naming');
 const { nameFromUrl } = require('./scanlogic');
-const { youtubeChannelBase, youtubeTabs, siteName } = require('./urls');
+const { youtubeChannelBase, youtubeTabs, siteName, looksLikeVideo } = require('./urls');
 
 function bestThumb(info) {
   if (info.thumbnail) return info.thumbnail;
@@ -86,7 +86,16 @@ class Prober {
     const ytBase = youtubeChannelBase(url);
     if (ytBase) return this.lookupList(url, { ...opts, include: opts.include || { videos: true, shorts: false, streams: false } });
     const info = await this.dump(url, opts);
-    if (info._type === 'playlist' || Array.isArray(info.entries)) return this.listFromInfo(url, info, opts);
+    if (info._type === 'playlist' || Array.isArray(info.entries)) {
+      // A video page whose player shows up as a "list of one": it's just that video.
+      const entries = Array.isArray(info.entries) ? info.entries.filter(Boolean) : [];
+      if (entries.length === 1 && looksLikeVideo(url) && !looksLikeList(entries[0])) {
+        const one = entries[0];
+        if (one.formats) return normaliseVideo({ ...one, webpage_url: one.webpage_url || url });
+        if (one.url) { try { return normaliseVideo(await this.dump(one.url, opts)); } catch { /* fall back to the list */ } }
+      }
+      return this.listFromInfo(url, info, opts);
+    }
     return normaliseVideo(info);
   }
 

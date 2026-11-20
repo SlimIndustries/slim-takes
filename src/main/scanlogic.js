@@ -297,4 +297,116 @@ const AGE_CLICK = String.raw`(() => {
   return scored[0].t.slice(0, 60);
 })()`;
 
-module.exports = { uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };
+
+// ---------- getting a video straight from its page (sites that refuse the engine) ----------
+
+// Runs inside the page: lists the video files the page's player could use, starts playback (muted)
+// so the player asks for the video, and reads the title, length and thumbnail.
+// Is the page Cloudflare's "are you human" check?
+const CF_CHECK = String.raw`(() => !!(window._cf_chl_opt || /^just a moment/i.test(document.title) ||
+  document.querySelector('#challenge-form, #challenge-stage, #challenge-running, iframe[src*="challenges.cloudflare.com"]')))()`;
+
+const MEDIA_PROBE_FN = String.raw`((click) => {
+  const abs = (u) => { try { return new URL(u, location.href).href; } catch (e) { return null; } };
+  const out = [];
+  const add = (u, label, from) => { const a = u && abs(String(u).trim()); if (a && /^https?:/i.test(a)) out.push({ url: a, label: String(label || ''), from }); };
+  const vids = [...document.querySelectorAll('video')].sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
+  for (const v of vids) {
+    if (v.currentSrc && !/^blob:/.test(v.currentSrc)) add(v.currentSrc, '', 'video');
+    if (v.getAttribute('src')) add(v.getAttribute('src'), '', 'video');
+    for (const so of v.querySelectorAll('source')) add(so.getAttribute('src'), so.getAttribute('label') || so.getAttribute('size') || so.getAttribute('res') || so.getAttribute('title') || '', 'source');
+  }
+  for (const m of document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[itemprop="contentUrl"]')) add(m.getAttribute('content'), '', 'meta');
+  const walk = (o) => { if (!o || typeof o !== 'object') return; if (Array.isArray(o)) { o.forEach(walk); return; } if (typeof o.contentUrl === 'string') add(o.contentUrl, '', 'meta'); for (const k in o) walk(o[k]); };
+  for (const sc of document.querySelectorAll('script[type="application/ld+json"]')) { try { walk(JSON.parse(sc.textContent)); } catch (e) { } }
+  // Video addresses written into the page's player setup.
+  const html = document.documentElement.innerHTML;
+  for (const m of html.match(/https?:(?:\\?\/){2}[^"'\s<>()]+?\.(?:mp4|m3u8|webm)(?:\?[^"'\s<>()]*)?/gi) || []) {
+    const before = html.slice(Math.max(0, html.indexOf(m) - 80), html.indexOf(m));
+    const q = (before.match(/(\d{3,4})p?["'\s]*[:=,]\s*["']?[^"']*$/i) || [])[1] || '';
+    add(m.replace(/\\\//g, '/').replace(/&amp;/g, '&'), q, 'script');
+  }
+  // Start the main video (muted) so the player asks for the file.
+  const v0 = vids[0];
+  if (v0) { try { v0.muted = true; const pr = v0.play(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) { } }
+  if (click && (!v0 || v0.paused)) {
+    const btn = document.querySelector('.vjs-big-play-button, .jw-display-icon-container, .fp-play, .plyr__control--overlaid, [aria-label*="play" i]:not(a[href]), button[class*="play" i], div[class*="play-button" i]');
+    if (btn) { try { btn.click(); } catch (e) { } }
+  }
+  let dur = v0 && isFinite(v0.duration) && v0.duration > 0 ? v0.duration : null;
+  const md = document.querySelector('meta[property="video:duration"], meta[property="og:video:duration"]');
+  if (!dur && md) dur = Number(md.getAttribute('content')) || null;
+  if (!dur) {
+    const iso = (html.match(/"duration"\s*:\s*"(PT[^"]+)"/) || [])[1];
+    const m = iso && iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?/);
+    if (m) dur = ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) || null;
+  }
+  const ogt = document.querySelector('meta[property="og:title"]');
+  const h1 = document.querySelector('h1');
+  const ogi = document.querySelector('meta[property="og:image"]');
+  return {
+    out,
+    title: ((ogt && ogt.getAttribute('content')) || (h1 && h1.textContent) || document.title || '').trim(),
+    thumb: (ogi && abs(ogi.getAttribute('content'))) || (v0 && v0.poster ? abs(v0.poster) : null),
+    duration: dur,
+    at: location.href,
+    ua: navigator.userAgent
+  };
+})`;
+/** The page script, with or without pressing the player's play button. */
+const mediaProbe = (click = true) => `${MEDIA_PROBE_FN}(${click ? 'true' : 'false'})`;
+const MEDIA_PROBE = mediaProbe(true);
+
+const AD_RE = /(^|[/._=-])(ads?|adserver|vast|vpaid|preroll|midroll|banner|promo|trailer|teaser|preview|previews|thumbs?|sprite|intro)([/._=-]|$)/i;
+
+function heightOf(text) {
+  const m = String(text || '').match(/(?:^|[^\d])(2160|1440|1080|720|540|480|360|240)(?:p|[^\d]|$)/i);
+  if (m) return Number(m[1]);
+  if (/\b4k\b/i.test(text)) return 2160;
+  return null;
+}
+
+/**
+ * Choose the video file to download from what the page offered.
+ * candidates: [{ url, label, from }] from the page; network: [{ url, type, len }] the player asked for.
+ */
+function pickMedia(candidates, network = []) {
+  const all = [];
+  for (const c of candidates || []) all.push({ url: c.url, label: c.label || '', from: c.from || 'page', len: 0 });
+  for (const n of network || []) all.push({ url: n.url, label: '', from: 'net', len: n.len || 0, type: n.type || '' });
+  const seen = new Set();
+  const scored = [];
+  for (const c of all) {
+    let u;
+    try { u = new URL(c.url); } catch { continue; }
+    if (!/^https?:$/.test(u.protocol)) continue;
+    const key = u.href.split('#')[0];
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const isHls = /\.m3u8(\?|$)/i.test(u.pathname + u.search) || /mpegurl/i.test(c.type || '');
+    const isFile = /\.(mp4|m4v|webm|mov)(\?|$)/i.test(u.pathname) || /^video\//i.test(c.type || '');
+    if (!isHls && !isFile) continue;
+    if (AD_RE.test(u.pathname)) continue;
+    if (isFile && c.len && c.len < 300000) continue; // tiny clips: ads and previews
+    if (/\.(ts|m4s)(\?|$)/i.test(u.pathname)) continue; // stream pieces, not the stream
+    const height = heightOf(c.label) || heightOf(u.pathname);
+    let score = height || (isHls ? 1500 : 600);
+    if (isHls && /master|playlist|index/i.test(u.pathname)) score += 300;
+    if (c.from === 'video' || c.from === 'source') score += 50;
+    if (c.from === 'net') score += 20;
+    scored.push({ url: u.href, height, hls: isHls, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] || null;
+}
+
+/** "Some Video Title - SiteName" -> "Some Video Title" (drops the site's own name from page titles). */
+function cleanPageTitle(title, host) {
+  const t = String(title || '').replace(/\s+/g, ' ').trim();
+  const label = String(host || '').replace(/^www\./, '').split('.')[0].toLowerCase();
+  const parts = t.split(/\s+[|\-–—]\s+/);
+  while (parts.length > 1 && label && parts[parts.length - 1].toLowerCase().replace(/[^a-z0-9]/g, '').includes(label.replace(/[^a-z0-9]/g, ''))) parts.pop();
+  return parts.join(' - ').trim() || t;
+}
+
+module.exports = { CF_CHECK, MEDIA_PROBE, mediaProbe, pickMedia, cleanPageTitle, heightOf, uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };

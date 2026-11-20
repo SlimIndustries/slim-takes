@@ -191,6 +191,7 @@ function wireEvents() {
     refreshFree();
   });
   api.on('queue:diskLow', (free) => toast(`Downloads paused: only ${fmtBytes(free)} left on the drive.`, 8000));
+  api.on('queue:needsPass', ({ host, count }) => toast(`${count} download${count === 1 ? '' : 's'} from ${host || 'a site'} ${count === 1 ? 'is' : 'are'} waiting for a fresh pass. Use "Open the page" in Channel grab (or your normal browser) and they'll carry on by themselves.`, 12000));
   api.on('watch:changed', (w) => { state.watch = w; if (state.view === 'watch') renderView(); });
   api.on('history:changed', () => { if (state.view === 'history') loadHistory(); });
   api.on('clipboard:links', (links) => {
@@ -436,7 +437,8 @@ function specFromVideo(v, o) {
     duration: v.duration, thumbnail: v.thumbnail, format: o.format, quality: o.quality,
     trim: (o.trimStart || o.trimEnd) ? { start: o.trimStart, end: o.trimEnd } : null,
     subs: o.subs, sponsorblock: o.sponsorblock, liveFromStart: o.liveFromStart, isLive: v.isLive,
-    private: state.private, source: 'single'
+    private: state.private, source: 'single',
+    direct: v.direct || null // (a video taken from its page: a ticket the app swaps for the real details)
   };
 }
 
@@ -564,9 +566,9 @@ function renderQueue() {
     h('span', { class: 'mute', id: 'qsummary', text: `${counts.down} downloading · ${counts.wait} waiting · ${counts.done} done` + (speed ? ` · ${fmtBytes(speed)}/s` : '') }),
     h('label', { class: 'row small mute', style: { marginLeft: 'auto', gap: '8px' } }, 'When done',
       select([['nothing', 'Do nothing'], ['sleep', 'Sleep'], ['shutdown', 'Shut down']], state.settings.whenDone, (x) => saveSettings({ whenDone: x }))),
-    state.paused
-      ? h('button', { type: 'button', class: 'btn primary', onclick: () => api.resumeAll() }, 'Resume all')
-      : h('button', { type: 'button', class: 'btn', onclick: () => api.pauseAll() }, 'Pause all'),
+    state.paused || state.items.some((i) => i.status === 'paused')
+      ? h('button', { type: 'button', class: 'btn primary', onclick: () => api.resumeAll() }, 'Resume all') : null,
+    !state.paused ? h('button', { type: 'button', class: 'btn', onclick: () => api.pauseAll() }, 'Pause all') : null,
     counts.down + counts.wait ? h('button', { type: 'button', class: 'btn', onclick: async () => {
       const n = counts.down + counts.wait;
       if (!(await confirmBox('Cancel all', `Cancel ${n} download${n === 1 ? '' : 's'} that ${n === 1 ? 'hasn\'t' : 'haven\'t'} finished? Anything already downloaded stays.`, { yes: 'Cancel them', no: 'Keep them' }))) return;
@@ -596,7 +598,7 @@ function queueRow(it) {
   } else if (it.status === 'waiting') detail = it.note || 'Waiting for a free slot';
   else if (it.status === 'done') detail = it.filePath ? it.filePath : 'Saved';
   else if (it.status === 'skipped') detail = it.note || 'Skipped';
-  else if (it.status === 'paused') detail = 'Paused — will continue where it left off';
+  else if (it.status === 'paused') detail = it.note || 'Paused — will continue where it left off';
   else if (it.status === 'canceled') detail = 'Canceled';
 
   const actions = [];
@@ -807,15 +809,7 @@ async function loadGrab(url) {
   try {
     const r = await api.lookupList(g.url, { include: g.include, format: g.format, quality: g.quality, private: state.private });
     off();
-    if (r.kind !== 'list') {
-      // It was a single video after all.
-      g.loading = false;
-      go('downloads');
-      state.preview = r;
-      state.previewOpts = { format: state.settings.format, quality: state.settings.quality, trimStart: '', trimEnd: '', subs: state.settings.subs, sponsorblock: state.settings.sponsorblock, liveFromStart: false };
-      renderPreview();
-      return;
-    }
+    if (r.kind !== 'list') { showSingle(r); return; }
     showGrabResult(r);
   } catch (e) {
     off();
@@ -825,7 +819,24 @@ async function loadGrab(url) {
   }
 }
 
+// A single video (from Channel grab, or from Open the page): show it in Downloads, ready to grab.
+function showSingle(r) {
+  const g = state.grab;
+  g.loading = false;
+  g.error = null;
+  g.result = null;
+  go('downloads');
+  state.preview = r;
+  state.previewOpts = {
+    format: state.pasteFormat || state.settings.format,
+    quality: bestQualityFor(r, state.pasteQuality || state.settings.quality),
+    trimStart: '', trimEnd: '', subs: state.settings.subs, sponsorblock: state.settings.sponsorblock, liveFromStart: false
+  };
+  renderPreview();
+}
+
 function showGrabResult(r) {
+  if (r && r.kind !== 'list') { showSingle(r); return; }
   const g = state.grab;
   g.loading = false;
   g.error = null;
@@ -888,6 +899,7 @@ function grabResult() {
       h('div', { style: { fontSize: '20px', fontWeight: 700 }, text: r.title }),
       h('div', { class: 'mute', text: `${r.site} · ${r.entries.length} videos found` + (haveCount ? ` · ${haveCount} already downloaded (will be skipped)` : '') }),
       h('div', { class: 'small mute' }, 'Saves to ', h('span', { style: { color: 'var(--text)' }, text: `${r.folder}\\` })),
+      r.note ? h('div', { class: 'small err', role: 'status', text: r.note }) : null,
       r.scanned ? h('div', { class: 'small hot' }, 'Found by reading the page directly. Lengths and dates fill in as each video downloads. ',
           h('a', { href: '#', onclick: (e) => { e.preventDefault(); showMeScan(r.url); } }, 'Missing some? Open the page'))
         : h('a', { href: '#', class: 'small', onclick: (e) => { e.preventDefault(); scanGrab(r.url); } }, 'Missing videos? Scan the page instead')),

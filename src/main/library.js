@@ -32,7 +32,7 @@ class Library {
     this.log = log || (() => {});
     this.cache = {};       // dir -> { name: { size, mtimeMs, duration } }
     this.reserved = {};    // dir -> Set of lower-case bases claimed by queued downloads
-    this.archive = new Set(); // "extractor id"
+    this.archive = new Map(); // "extractor id" -> the file it was saved as
     this.folders = {};        // video link or ID -> creator folder it was saved under
     this.load();
   }
@@ -41,7 +41,9 @@ class Library {
     try {
       const data = JSON.parse(fs.readFileSync(this.storeFile, 'utf8'));
       this.cache = data.cache || {};
-      this.archive = new Set(data.archive || []);
+      // (Older versions kept IDs without the file, so a deleted file could stay "already have it" forever.
+      // Those are dropped: real duplicates on disk are still caught by title and length.)
+      this.archive = new Map(Object.entries(data.files || {}));
       this.folders = data.folders || {};
     } catch { /* first run */ }
   }
@@ -49,7 +51,7 @@ class Library {
   save() {
     const tmp = this.storeFile + '.tmp';
     try {
-      fs.writeFileSync(tmp, JSON.stringify({ cache: this.cache, archive: [...this.archive], folders: this.folders }));
+      fs.writeFileSync(tmp, JSON.stringify({ cache: this.cache, files: Object.fromEntries(this.archive), folders: this.folders }));
       fs.renameSync(tmp, this.storeFile);
     } catch (e) { this.log('Could not save library: ' + e.message); }
   }
@@ -58,13 +60,27 @@ class Library {
     return `${String(extractor || '').toLowerCase()} ${id}`;
   }
 
+  /** Already downloaded? Only if the file it was saved as is still there. */
   hasId(extractor, id) {
-    return !!id && this.archive.has(Library.key(extractor, id));
+    if (!id) return false;
+    const key = Library.key(extractor, id);
+    const file = this.archive.get(key);
+    if (!file) return false;
+    if (fs.existsSync(file)) return true;
+    this.archive.delete(key); // deleted or moved away: free to download again
+    this.save();
+    return false;
   }
 
-  addId(extractor, id) {
-    if (!id) return;
-    this.archive.add(Library.key(extractor, id));
+  addId(extractor, id, filePath) {
+    if (!id || !filePath) return;
+    this.archive.set(Library.key(extractor, id), filePath);
+    this.save();
+  }
+
+  /** Forget every downloaded ID (Clear history). Files on disk are still caught by title and length. */
+  clearIds() {
+    this.archive.clear();
     this.save();
   }
 
@@ -98,6 +114,12 @@ class Library {
 
   entries(dir) {
     const files = this.cache[dir] || {};
+    // Drop files that were deleted since the folder was last read (even while the app was closed).
+    let dropped = false;
+    for (const name of Object.keys(files)) {
+      if (!fs.existsSync(path.join(dir, name))) { delete files[name]; dropped = true; }
+    }
+    if (dropped) this.save();
     const list = Object.entries(files).map(([name, v]) => ({ base: splitExt(name).base, duration: v.duration }));
     for (const r of this.reserved[dir] || []) list.push({ base: r, duration: null });
     return list;

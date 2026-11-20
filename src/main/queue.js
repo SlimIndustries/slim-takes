@@ -15,6 +15,11 @@ const { ensureDir, freeBytes } = require('./util');
 
 const ACTIVE = new Set(['starting', 'downloading', 'processing']);
 const FINISHED = new Set(['done', 'failed', 'skipped', 'canceled']);
+const DIRECT_STALE_MS = 30 * 60 * 1000;
+const NOTICE_DELAY_MS = 3000; // video links taken from a page: refresh after this long
+const { hostOf } = require('./sites');
+/** A video page's own ID: the last part of its address (what the engine would call it too). */
+function pageId(url) { try { const p = new URL(url).pathname.split('/').filter(Boolean); return p[p.length - 1] || null; } catch { return null; } }
 const RECODE_HINT = /remux|recode|conversion failed|could not write header|Postprocessing|codec/i;
 
 // What goes in the log: never the title or path of a Private-mode download.
@@ -36,9 +41,14 @@ function killTree(child) {
 }
 
 class Queue extends EventEmitter {
-  constructor({ engine, library, getSettings, log, store, history, notify, sites }) {
+  constructor({ engine, library, getSettings, log, store, history, notify, sites, resolveDirect }) {
     super();
     this.sites = sites || null; // per-site extras (Cloudflare); optional
+    // async (pageUrl, { quiet }) => { mediaUrl, referer, ua, cookieFile }: gets a video file from its page
+    // for sites that refuse the engine. Optional.
+    this.resolveDirect = resolveDirect || null;
+    this.resolvingNow = false;      // one page-window lookup at a time
+    this.heldHosts = new Set();     // sites whose downloads are waiting for a fresh pass
     this.engine = engine;
     this.library = library;
     this.getSettings = getSettings;
@@ -69,7 +79,7 @@ class Queue extends EventEmitter {
 
   persist() {
     this.store.set(this.items.filter((i) => !FINISHED.has(i.status) && !i.private).map((i) => {
-      const { process: _p, ...rest } = i;
+      const { process: _p, resolving: _r, ...rest } = i;
       return rest;
     }));
   }
@@ -84,7 +94,8 @@ class Queue extends EventEmitter {
       id: i.id, url: i.url, title: i.title, folder: i.folder, site: i.site, format: i.format, quality: i.quality,
       thumbnail: i.thumbnail, status: i.status, pct: i.pct, speed: i.speed, eta: i.eta, downloaded: i.downloaded,
       total: i.total, error: i.error, note: i.note, filePath: i.filePath, private: !!i.private, attempts: i.attempts,
-      isLive: !!i.isLive, source: i.source, addedAt: i.addedAt, finishedAt: i.finishedAt || null
+      isLive: !!i.isLive, source: i.source, addedAt: i.addedAt, finishedAt: i.finishedAt || null,
+      heldForPass: !!i.heldForPass
     };
   }
 
@@ -122,6 +133,8 @@ class Queue extends EventEmitter {
       isLive: !!spec.isLive,
       private: !!spec.private,
       source: spec.source || 'single',
+      direct: spec.direct && spec.direct.mediaUrl ? { ...spec.direct, at: spec.direct.at || Date.now() } : null, // a video file found on its page (sites that refuse the engine)
+      needWindow: !!(spec.direct && spec.direct.mediaUrl), // get (fresh) video links through the page window
       status: 'waiting',
       pct: 0, speed: null, eta: null, downloaded: null, total: null,
       attempts: 0, forceRecode: false, error: null, note: null, filePath: null,
@@ -159,6 +172,7 @@ class Queue extends EventEmitter {
     if (it && (it.status === 'paused' || it.status === 'failed' || it.status === 'canceled')) {
       if (it.status !== 'paused') it.attempts = 0;
       it.status = 'waiting'; it.error = null; it.note = null; it.retryAt = 0;
+      if (it.heldForPass) { it.heldForPass = false; this.heldHosts.delete(hostOf(it.url)); }
       if (this.paused) { this.paused = false; this.emit('state'); }
       this.changed(it); this.pump();
     }
@@ -167,7 +181,9 @@ class Queue extends EventEmitter {
   retry(id) {
     const it = this.find(id);
     if (!it) return;
+    // A retry really retries: forget what was tried last time.
     it.attempts = 0; it.forceRecode = false;
+    it.cfRetried = false; it.directRetried = false; it.engineFallback = false; it.triedWindow = false;
     this.resume(id);
   }
 
@@ -235,7 +251,12 @@ class Queue extends EventEmitter {
 
   resumeAll() {
     this.paused = false;
-    for (const it of this.items) if (it.status === 'paused') it.status = 'waiting';
+    for (const it of this.items) {
+      if (it.status !== 'paused') continue;
+      it.status = 'waiting';
+      if (it.heldForPass) { it.heldForPass = false; it.note = null; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; }
+    }
+    this.heldHosts.clear();
     this.persist();
     this.emit('list');
     this.emit('state');
@@ -261,9 +282,22 @@ class Queue extends EventEmitter {
     const now = Date.now();
     let soonest = Infinity;
 
+    // Video links taken from a page go stale: get a fresh one rather than wait for it to fail.
+    for (const it of this.items) {
+      if (it.status === 'waiting' && it.direct && now - (it.direct.at || 0) > DIRECT_STALE_MS) { it.direct = null; it.needWindow = true; }
+    }
+    // Videos that come through the page window: one page at a time, without taking a download slot.
+    const forWindow = this.items.filter((i) => i.status === 'waiting' && !i.resolving && this.needsPage(i) && !(i.retryAt > now));
+    if (!this.resolvingNow && forWindow.length) this.resolveNext(forWindow.shift());
+    forWindow.forEach((i, n) => {
+      const note = `Waiting for the page window (${n + 1} ahead)`;
+      if (i.note !== note) { i.note = note; this.changed(i); }
+    });
+
     for (const it of this.items) {
       if (running >= limit) break;
       if (it.status !== 'waiting') continue;
+      if (it.resolving || this.needsPage(it)) continue;
       if (it.retryAt && it.retryAt > now) { soonest = Math.min(soonest, it.retryAt - now); continue; }
       if (s.polite) {
         const last = this.lastStartBySite[it.site] || 0;
@@ -286,6 +320,85 @@ class Queue extends EventEmitter {
     }
     if (soonest !== Infinity) this.pumpTimer = setTimeout(() => this.pump(), Math.min(soonest + 50, 60000));
     this.checkIdle();
+  }
+
+  /** Does this download need its video link from the page window first? */
+  needsPage(it) {
+    if (it.direct || it.engineFallback || !this.resolveDirect) return false;
+    return !!(it.needWindow || (this.sites && this.sites.needsWindow(it.url)));
+  }
+
+  resolveNext(it) {
+    this.resolvingNow = true;
+    it.resolving = true;
+    it.triedWindow = true;
+    it.note = 'Getting the video from its page…';
+    this.changed(it);
+    this.resolveDirect(it.url, { quiet: it.private }).then((d) => {
+      if (!this.items.includes(it)) return;
+      it.direct = { ...d, at: Date.now() };
+      it.needWindow = true;
+      if (it.status === 'waiting') it.note = null;
+    }).catch((e) => {
+      if (!this.items.includes(it) || it.status !== 'waiting') return;
+      if (e.siteCheck || e.passExpired) return this.holdSite(it, e.message);
+      // The page window couldn't find the video: give the engine a go instead, once.
+      this.log.warn(`${label(it)}: page window: ${it.private ? 'failed' : e.message}`);
+      it.engineFallback = true;
+      it.note = null;
+    }).finally(() => {
+      it.resolving = false;
+      this.resolvingNow = false;
+      if (this.items.includes(it)) this.changed(it);
+      this.pump();
+    });
+  }
+
+  /**
+   * A site refused the download even with its pass: rather than fail its downloads one by one,
+   * hold all of them until the user gets a fresh pass (then they carry on by themselves).
+   */
+  holdSite(it, reason) {
+    const host = hostOf(it.url);
+    const note = 'Waiting: this site needs a fresh pass';
+    let count = 0;
+    for (const x of this.items) {
+      if (hostOf(x.url) !== host) continue;
+      if (x === it || x.status === 'waiting' || (x.status === 'paused' && x.heldForPass)) {
+        x.status = 'paused'; x.heldForPass = true; x.note = note; x.error = x === it ? friendlyError(reason) : x.error;
+        x.retryAt = 0;
+        count++;
+        this.changed(x);
+      }
+    }
+    this.persist();
+    this.log.warn(`Held ${count} download(s) from a site that needs a fresh pass` + (it.private ? '' : ` (${host})`));
+    if (!this.heldHosts.has(host)) {
+      // Say so once, after a moment (downloads already running from the site usually join in).
+      this.heldHosts.add(host);
+      setTimeout(() => {
+        const held = this.items.filter((x) => x.heldForPass && hostOf(x.url) === host);
+        if (held.length) this.emit('needsPass', { host, count: held.length, private: held.every((x) => x.private) });
+      }, NOTICE_DELAY_MS).unref?.();
+    }
+    this.pump();
+  }
+
+  /** The user got a fresh pass for a site: carry on with its held downloads. */
+  releaseSite(urlOrHost) {
+    const host = /^https?:/i.test(urlOrHost) ? hostOf(urlOrHost) : urlOrHost;
+    let n = 0;
+    for (const x of this.items) {
+      if (x.heldForPass && hostOf(x.url) === host) {
+        x.status = 'waiting'; x.heldForPass = false; x.note = null; x.error = null;
+        x.directRetried = false; x.engineFallback = false; x.cfRetried = false; x.triedWindow = false; x.attempts = 0;
+        n++;
+        this.changed(x);
+      }
+    }
+    this.heldHosts.delete(host);
+    if (n) { this.persist(); this.pump(); }
+    return n;
   }
 
   checkIdle() {
@@ -332,7 +445,7 @@ class Queue extends EventEmitter {
       embed: s.embed,
       cover: s.cover,
       speedLimitBytes: s.speedLimitMB ? (s.speedLimitMB * 1e6) / concurrent : 0,
-      cookiesBrowser: this.sites && this.sites.hasPass(it.url) ? 'none' : s.cookiesBrowser,
+      cookiesBrowser: it.direct || (this.sites && this.sites.hasPass(it.url)) ? 'none' : s.cookiesBrowser,
       liveFromStart: it.liveFromStart,
       dateAfter: it.filters && it.filters.dateAfter,
       dateBefore: it.filters && it.filters.dateBefore,
@@ -349,8 +462,8 @@ class Queue extends EventEmitter {
       '--no-playlist', '--no-mtime', '--retries', '10', '--fragment-retries', '10',
       '-o', out,
       ...buildArgs(opts),
-      ...(this.sites ? this.sites.argsFor(it.url) : []),
-      '--', it.url
+      ...(this.sites ? (it.direct ? this.sites.directArgs(it.direct) : this.sites.argsFor(it.url)) : []),
+      '--', it.direct ? it.direct.mediaUrl : it.url
     ];
     this.log.info(it.private ? 'Start: [private download]' : `Start: ${it.title} -> ${path.join(it.folder, it.base)}.${ext}`);
 
@@ -471,8 +584,29 @@ class Queue extends EventEmitter {
     }
     const s = this.getSettings();
     it.attempts = (it.attempts || 0) + 1;
-    // Still blocked by the site's protection: retrying won't help, say what will.
+    // A video file taken from its page was refused: links like that expire, so get a fresh one once.
+    if (it.direct && /HTTP Error 4\d\d|Forbidden|expired/i.test(message)) {
+      it.direct = null;
+      if (this.resolveDirect && !it.directRetried) {
+        it.directRetried = true;
+        it.needWindow = true;
+        it.status = 'waiting'; it.note = 'Getting a fresh video link from the page…';
+        this.changed(it); this.pump();
+        return;
+      }
+      return this.holdSite(it, 'The site refused the video file too, even through the page window.');
+    }
+    // The site refuses the engine even with a pass: get its videos through the page window from now on.
+    if (this.sites && this.resolveDirect && this.sites.isBlocked(it.url, message) && this.sites.hasPass(it.url) && !it.engineFallback && !it.triedWindow) {
+      this.sites.markNeedsWindow(it.url);
+      it.needWindow = true;
+      it.status = 'waiting'; it.note = 'Site refused the engine, getting the video from its page…';
+      this.changed(it); this.pump();
+      return;
+    }
+    // Still blocked by the site's protection: retrying now won't help. Hold the site's downloads until there's a fresh pass.
     if (this.sites && this.sites.isBlocked(it.url, message)) {
+      if (this.resolveDirect) return this.holdSite(it, (this.sites.hasPass(it.url) ? 'Cloudflare still refused even with your pass. ' : '') + 'Cloudflare anti-bot challenge');
       return this.fail(it, (this.sites.hasPass(it.url) ? 'Cloudflare still refused even with your pass. ' : '') + 'Cloudflare anti-bot challenge');
     }
     const permanent = /cloudflare|anti-bot|unavailable|private video|removed|not available|copyright|members-only|sign in to confirm your age|DRM|Unsupported URL|404/i.test(message);
@@ -509,8 +643,11 @@ class Queue extends EventEmitter {
     if (when && this.getSettings().setFileDate !== false) {
       try { fs.utimesSync(done.filepath, new Date(), when); } catch (e) { this.log.warn('Could not set file date: ' + (it.private ? 'private file' : e.message)); }
     }
-    this.library.addId(done.extractor || it.extractor, done.id || it.videoId);
-    this.library.rememberFolder({ url: it.url, extractor: done.extractor || it.extractor, id: done.id || it.videoId }, it.folder);
+    // (A file taken straight from a page has no engine ID of its own: use the video page's.)
+    const idExtractor = it.direct ? it.extractor : (done.extractor || it.extractor);
+    const vid = it.direct ? (it.videoId || pageId(it.url)) : (done.id || it.videoId);
+    this.library.addId(idExtractor, vid, done.filepath);
+    this.library.rememberFolder({ url: it.url, extractor: idExtractor, id: vid }, it.folder);
     this.library.noteFile(done.filepath, done.duration || it.duration);
     this.release(it);
     try { it.total = fs.statSync(done.filepath).size; } catch { /* ignore */ }
