@@ -1,0 +1,32 @@
+name: Build Slim Takes
+
+# Runs when you push a tag like v1.0.0 (or press "Run workflow" on GitHub).
+# It tests the code, builds the portable .exe on a Windows machine, and attaches it to a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: node --test test/core.test.js
+      - run: npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SlimTakes-portable
+          path: dist/*.exe
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
