@@ -49,7 +49,32 @@ function isMenuLink(u) {
   const first = (u.pathname.split('/')[1] || '').toLowerCase();
   return MENU_FIRST.test(first) || NOT_VIDEO_ANYWHERE.test(u.pathname + u.search);
 }
-const HAS_ID = /\d/;
+// Does a link look like it points at one video? Most video links carry an ID: a number (/video/12345),
+// a code (/watch/abmLnwJoxQZ: capital and small letters mixed), or a name right after a video word
+// (/watch/some-title).
+function hasVideoId(u) {
+  const p = u.pathname + u.search;
+  if (/\d/.test(p)) return true;
+  const segs = u.pathname.split('/').filter(Boolean);
+  if (segs.some((s) => s.length >= 6 && /^[A-Za-z0-9_-]+$/.test(s) && /[a-z]/.test(s) && /[A-Z]/.test(s))) return true;
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (/^(video|videos|watch|v|clip|clips|movie|movies|embed|view|play)$/i.test(segs[i]) && segs[i + 1].length >= 3 &&
+      !/^(later|history|liked|likes|new|newest|popular|top|top-rated|trending|random|recent|latest|featured|all|hot|best|categories|category|playlists?|channels?|search|tags?|upload|list)$/i.test(segs[i + 1])) return true;
+  }
+  return false;
+}
+
+// The site a host belongs to ("m.example.co.uk" and "www.example.co.uk" -> "example.co.uk"),
+// so videos linked on another part of the same site still count.
+function siteKey(host) {
+  if (/^\d+(\.\d+){3}$/.test(String(host)) || !String(host).includes('.')) return String(host).toLowerCase(); // an IP or "localhost"
+  const parts = String(host || '').toLowerCase().replace(/\.$/, '').split('.');
+  if (parts.length <= 2) return parts.join('.');
+  const sld = parts[parts.length - 2];
+  const tld = parts[parts.length - 1];
+  const keep = tld.length === 2 && /^(co|com|net|org|ac|gov|edu|ne|or|go)$/.test(sld) ? 3 : 2;
+  return parts.slice(-keep).join('.');
+}
 
 /**
  * links: [{ href, text, thumb }] collected from the page(s).
@@ -66,18 +91,18 @@ const HAS_ID = /\d/;
 function candidateGroups(links, pageUrl) {
   let base;
   try { base = new URL(pageUrl); } catch { return []; }
-  const host = base.hostname.replace(/^www\./, '');
+  const site = siteKey(base.hostname);
   const byHref = new Map();
   for (const l of links) {
     let u;
     try { u = new URL(l.href, pageUrl); } catch { continue; }
     if (!/^https?:$/.test(u.protocol)) continue;
-    if (u.hostname.replace(/^www\./, '') !== host) continue;
+    if (siteKey(u.hostname) !== site) continue; // same site (any part of it: www., m., video.)
     u.hash = '';
     const key = u.origin + u.pathname + u.search;
     if (u.pathname === base.pathname) continue;
     if (isMenuLink(u)) continue;
-    if (!HAS_ID.test(u.pathname + u.search)) continue;
+    if (!hasVideoId(u)) continue;
     const prev = byHref.get(key);
     const text = (l.text || '').trim();
     if (!prev) byHref.set(key, { url: key, path: u.pathname + u.search, title: text, thumb: l.thumb || null, ctx: l.ctx || '' });
@@ -96,7 +121,9 @@ function candidateGroups(links, pageUrl) {
   const out = [];
   for (const [shape, items] of groups) {
     const hinted = VIDEO_HINT.test(shape) || VIDEO_HINT.test(items[0].path);
-    if (items.length < 2 && !hinted) continue;
+    // A single link only counts if it clearly looks like a video (channels with just one video).
+    const codeLike = items[0].path.split(/[/?&=]/).some((seg) => seg.length >= 6 && /^[A-Za-z0-9_-]+$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg));
+    if (items.length < 2 && !hinted && !codeLike) continue;
     out.push({
       shape,
       score: items.length * (hinted ? 3 : 1),
@@ -194,6 +221,19 @@ const COLLECT = String.raw`(() => {
     for (let up = 0; up < 4 && tile && tile.parentElement && distinct(tile.parentElement) <= 1; up++) tile = tile.parentElement;
     const ctx = tile ? (tile.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240) : '';
     links.push({ href, text, thumb: thumb && /^https?:/.test(thumb) ? thumb : null, ctx });
+  }
+  // Video tiles made clickable by the page's code instead of a normal link: read the address they carry.
+  for (const el of document.querySelectorAll('[data-href], [data-url], [data-link], [data-video-url], [onclick*="location"]')) {
+    if (el.closest('a[href]') || el.querySelector('a[href]')) continue;
+    let raw = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('data-link') || el.getAttribute('data-video-url') || '';
+    if (!raw) { const m = (el.getAttribute('onclick') || '').match(/location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/); raw = m ? m[1] : ''; }
+    if (!raw || /^(javascript:|#)/i.test(raw) || /\.(jpe?g|png|gif|webp|mp4|webm|m3u8)(\?|$)/i.test(raw)) continue;
+    const href = abs(raw);
+    if (!href) continue;
+    const img = el.querySelector('img');
+    const text = (el.getAttribute('title') || (img && img.getAttribute('alt')) || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    const thumb = img ? (img.getAttribute('data-src') || img.currentSrc || img.src || null) : null;
+    links.push({ href, text, thumb: thumb && /^https?:/.test(thumb) ? thumb : null, ctx: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240) });
   }
   let next = null;
   const rel = document.querySelector('link[rel="next"], a[rel="next"]');
@@ -311,7 +351,10 @@ const MEDIA_PROBE_FN = String.raw`((click) => {
   const out = [];
   const add = (u, label, from) => { const a = u && abs(String(u).trim()); if (a && /^https?:/i.test(a)) out.push({ url: a, label: String(label || ''), from }); };
   const vids = [...document.querySelectorAll('video')].sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
-  for (const v of vids) {
+  const area = (v) => v.clientWidth * v.clientHeight;
+  // Only the main player (and any player about as big): not small "related" previews.
+  const main = vids.filter((v, i) => i === 0 || area(v) >= 0.6 * area(vids[0]));
+  for (const v of main) {
     if (v.currentSrc && !/^blob:/.test(v.currentSrc)) add(v.currentSrc, '', 'video');
     if (v.getAttribute('src')) add(v.getAttribute('src'), '', 'video');
     for (const so of v.querySelectorAll('source')) add(so.getAttribute('src'), so.getAttribute('label') || so.getAttribute('size') || so.getAttribute('res') || so.getAttribute('title') || '', 'source');
@@ -344,8 +387,13 @@ const MEDIA_PROBE_FN = String.raw`((click) => {
   const ogt = document.querySelector('meta[property="og:title"]');
   const h1 = document.querySelector('h1');
   const ogi = document.querySelector('meta[property="og:image"]');
+  const text = (document.body ? document.body.innerText : '').slice(0, 20000);
+  const loginWall = !!document.querySelector('input[type="password"]') ||
+    /(sign|log)\s?in to (watch|view|continue)|members only|subscribe to (watch|view|unlock)|join (now )?to (watch|unlock)|this video is (for|only for) (members|subscribers)/i.test(text);
   return {
     out,
+    player: v0 ? { w: v0.clientWidth, h: v0.clientHeight } : null,
+    loginWall,
     title: ((ogt && ogt.getAttribute('content')) || (h1 && h1.textContent) || document.title || '').trim(),
     thumb: (ogi && abs(ogi.getAttribute('content'))) || (v0 && v0.poster ? abs(v0.poster) : null),
     duration: dur,
@@ -358,6 +406,8 @@ const mediaProbe = (click = true) => `${MEDIA_PROBE_FN}(${click ? 'true' : 'fals
 const MEDIA_PROBE = mediaProbe(true);
 
 const AD_RE = /(^|[/._=-])(ads?|adserver|vast|vpaid|preroll|midroll|banner|promo|trailer|teaser|preview|previews|thumbs?|sprite|intro)([/._=-]|$)/i;
+// Ad servers (by address), whatever the file is called.
+const AD_HOST_RE = /(^|\.)(ads?\d*|adserver|adserving|adsrv|vast|doubleclick|googlesyndication|googleadservices|imasdk|adnxs|adsrvr|serving-sys|syndication)\./i;
 
 function heightOf(text) {
   const m = String(text || '').match(/(?:^|[^\d])(2160|1440|1080|720|540|480|360|240)(?:p|[^\d]|$)/i);
@@ -386,7 +436,7 @@ function pickMedia(candidates, network = []) {
     const isHls = /\.m3u8(\?|$)/i.test(u.pathname + u.search) || /mpegurl/i.test(c.type || '');
     const isFile = /\.(mp4|m4v|webm|mov)(\?|$)/i.test(u.pathname) || /^video\//i.test(c.type || '');
     if (!isHls && !isFile) continue;
-    if (AD_RE.test(u.pathname)) continue;
+    if (AD_RE.test(u.pathname) || AD_HOST_RE.test(u.hostname)) continue;
     if (isFile && c.len && c.len < 300000) continue; // tiny clips: ads and previews
     if (/\.(ts|m4s)(\?|$)/i.test(u.pathname)) continue; // stream pieces, not the stream
     const height = heightOf(c.label) || heightOf(u.pathname);
@@ -394,10 +444,49 @@ function pickMedia(candidates, network = []) {
     if (isHls && /master|playlist|index/i.test(u.pathname)) score += 300;
     if (c.from === 'video' || c.from === 'source') score += 50;
     if (c.from === 'net') score += 20;
+    // Unlabelled files: the bigger one is the video (ads and previews are short).
+    if (!height && c.len) score += Math.min(300, Math.floor(c.len / 5e6));
     scored.push({ url: u.href, height, hls: isHls, score });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored[0] || null;
+}
+
+/**
+ * Is this the page of one video (a proper main player), rather than a list page with an autoplaying
+ * banner or preview? info: what the page probe returned (merged across frames).
+ */
+function isVideoPage(info) {
+  if (!info) return false;
+  const p = info.player;
+  if (p && p.w >= 320 && p.h >= 180) return true;
+  if (info.framePlayer) return true; // a full-size player inside a frame
+  return (info.out || []).some((c) => c.from === 'meta'); // the page itself says it's a video (og:video / VideoObject)
+}
+
+/** Why no video file turned up on a page: copy protection, a login wall, or just not found. */
+function explainNoMedia(info, requests = []) {
+  if ((requests || []).some((u) => /widevine|playready|fairplay|\/drm\/|[/._-]license([/?._-]|$)/i.test(u))) {
+    const e = new Error('This video is copy-protected (DRM), so it can\'t be downloaded.');
+    e.final = true;
+    return e;
+  }
+  if (info && info.loginWall) {
+    const e = new Error('This video needs you to be logged in on the site, so Slim Takes can\'t get it.');
+    e.final = true;
+    return e;
+  }
+  return new Error('Couldn\'t find the video on that page.');
+}
+
+/** Does this title look like a code or address part ("aPmEvq2pjlW") rather than a real title? */
+function looksLikeCode(title, url) {
+  const t = String(title || '').trim();
+  if (!t) return true;
+  let last = '';
+  try { last = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch { /* ignore */ }
+  if (last && t === last) return true;
+  return !/\s/.test(t) && /\d/.test(t) && /[a-z]/i.test(t);
 }
 
 /** "Some Video Title - SiteName" -> "Some Video Title" (drops the site's own name from page titles). */
@@ -409,4 +498,4 @@ function cleanPageTitle(title, host) {
   return parts.join(' - ').trim() || t;
 }
 
-module.exports = { CF_CHECK, MEDIA_PROBE, mediaProbe, pickMedia, cleanPageTitle, heightOf, uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };
+module.exports = { hasVideoId, siteKey, CF_CHECK, MEDIA_PROBE, mediaProbe, pickMedia, isVideoPage, explainNoMedia, looksLikeCode, cleanPageTitle, heightOf, uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };

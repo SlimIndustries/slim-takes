@@ -37,7 +37,7 @@
   ];
   const engineReady = params.get('setup') !== '1';
   window.slim = {
-    init: async () => ({ locked: params.get('locked') === '1', version: '1.2.3', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
+    init: async () => ({ locked: params.get('locked') === '1', version: '1.2.5', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
     verifyPin: async () => false, setPin: async () => settings,
     setSettings: async (p) => Object.assign(settings, p),
     engineStatus: async () => ({ ready: true }), installEngine: () => new Promise(() => {

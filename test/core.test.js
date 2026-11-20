@@ -505,3 +505,79 @@ test('page window: picks the real video file, not ads, previews or stream pieces
   assert.equal(cleanPageTitle('Jimmy Cuts Grass', 'example.com'), 'Jimmy Cuts Grass');
   assert.equal(heightOf('video_720p.mp4'), 720);
 });
+
+// ---------- v1.2.4: sites the engine doesn't know ----------
+test('page window traffic light: two pages at once, strict sites one at a time, never stuck', async () => {
+  const { Lanes } = require('../src/main/lanes');
+  const lanes = new Lanes(2);
+  let active = 0, peak = 0;
+  const perKey = new Map(), perKeyPeak = new Map();
+  const job = async (key, solo, ms) => {
+    const release = await lanes.acquire(key, solo);
+    active++; peak = Math.max(peak, active);
+    perKey.set(key, (perKey.get(key) || 0) + 1);
+    perKeyPeak.set(key, Math.max(perKeyPeak.get(key) || 0, perKey.get(key)));
+    await new Promise((r) => setTimeout(r, ms));
+    active--; perKey.set(key, perKey.get(key) - 1);
+    release(); release(); // a double release must be harmless
+  };
+  const jobs = [];
+  for (let i = 0; i < 40; i++) jobs.push(job(i % 3 === 0 ? 'strict' : 'open' + (i % 2), i % 3 === 0, 5 + (i % 7)));
+  await Promise.all(jobs);
+  assert.equal(peak, 2, 'never more than two pages at once');
+  assert.equal(perKeyPeak.get('strict'), 1, 'strict site: one at a time');
+  assert.equal(lanes.active, 0);
+  assert.equal(lanes.waiting.length, 0);
+});
+
+test('video finder helpers: ad servers, bigger files, real video pages, DRM and login walls, code titles', () => {
+  const { pickMedia, isVideoPage, explainNoMedia, looksLikeCode } = require('../src/main/scanlogic');
+  const pick = pickMedia([], [
+    { url: 'https://ads.example.net/creative/clip.mp4', len: 9e8 },
+    { url: 'https://cdn.example.net/x/small.mp4', len: 3e6 },
+    { url: 'https://cdn.example.net/x/main.mp4', len: 6e8 },
+    { url: 'https://imasdk.googleapis.com/v.mp4', len: 9e8 }
+  ]);
+  assert.equal(pick.url, 'https://cdn.example.net/x/main.mp4');
+  assert.ok(isVideoPage({ player: { w: 854, h: 480 }, out: [] }));
+  assert.ok(!isVideoPage({ player: { w: 240, h: 135 }, out: [{ from: 'video' }] }), 'small autoplay preview on a list page');
+  assert.ok(isVideoPage({ player: null, framePlayer: true, out: [] }), 'player inside a frame');
+  assert.ok(isVideoPage({ player: null, out: [{ from: 'meta' }] }), 'page says it is a video');
+  assert.ok(!isVideoPage(null));
+  const drm = explainNoMedia({}, ['https://lic.example.net/widevine/license?x=1']);
+  assert.ok(drm.final && /copy-protected/.test(drm.message));
+  const login = explainNoMedia({ loginWall: true }, []);
+  assert.ok(login.final && /logged in/.test(login.message));
+  const none = explainNoMedia({}, ['https://cdn.example.net/app.js']);
+  assert.ok(!none.final && /Couldn't find/.test(none.message));
+  assert.ok(looksLikeCode('aPmEvq2pjlW', 'https://x.com/watch/aPmEvq2pjlW'));
+  assert.ok(looksLikeCode('', 'https://x.com/watch/a'));
+  assert.ok(!looksLikeCode('Jimmy Cuts Grass', 'https://x.com/watch/1'));
+  assert.ok(!looksLikeCode('Grass', 'https://x.com/watch/1'));
+});
+
+test('page scan: video links without numbers, other parts of the same site, single-video channels', () => {
+  const { hasVideoId, siteKey, candidateGroups } = require('../src/main/scanlogic');
+  const id = (u) => hasVideoId(new URL(u));
+  assert.ok(id('https://x.com/watch/abmLnwJoxQZ'), 'code with no number');
+  assert.ok(id('https://x.com/video/jimmy-cuts-grass'), 'name after a video word');
+  assert.ok(id('https://x.com/v/12345'));
+  for (const u of ['https://x.com/watch/later', 'https://x.com/videos/popular', 'https://x.com/categories/lawns', 'https://x.com/about', 'https://x.com/watch/new'])
+    assert.ok(!id(u), u);
+  assert.equal(siteKey('m.example.co.uk'), 'example.co.uk');
+  assert.equal(siteKey('video.cdn.example.com'), 'example.com');
+  assert.equal(siteKey('127.0.0.1'), '127.0.0.1');
+  assert.equal(siteKey('localhost'), 'localhost');
+  const groups = candidateGroups([
+    { href: 'https://m.example.com/watch/abmLnwJoxQZ' },
+    { href: 'https://www.example.com/watch/b4jllLOAdjQ' },
+    { href: 'https://video.example.com/watch/ZRjdEaRQxlP' },
+    { href: 'https://another-site.net/watch/xYzAbCdEfG' }
+  ], 'https://www.example.com/star/jimmy');
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].items.length, 3, 'same site, any part of it; other sites ignored');
+  const single = candidateGroups([{ href: 'https://example.com/clip/aBcDeFgH' }, { href: 'https://example.com/about' }], 'https://example.com/star/jimmy');
+  assert.equal(single.length, 1, 'a channel with just one video');
+  const noise = candidateGroups([{ href: 'https://example.com/lawns' }, { href: 'https://example.com/news/today' }], 'https://example.com/star/jimmy');
+  assert.equal(noise.length, 0, 'plain words are still not videos');
+});

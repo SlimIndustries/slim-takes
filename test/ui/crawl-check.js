@@ -43,8 +43,32 @@ const homePage = () => { homeHits.count++; return `<h1>Home</h1>${nav}<div class
 
 const challenge = '<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-stage"></div></body></html>';
 const checkyTiles = (p) => Array.from({ length: PER }, (_, i) => 3000 + (p - 1) * PER + i).map((id) => `<div class="item"><a href="/video/${id}/c-${id}/"><img alt="C ${id}" src="/i/${id}.jpg"></a></div>`).join('');
+// v1.2.5 test sites
+const CODES = Array.from({ length: 30 }, (_, i) => {
+  const L = 'abcdefghijklmnopqrstuvwxyz';
+  const c = 'Qx' + L[i % 26] + L[(i * 5 + 3) % 26].toUpperCase() + L[Math.floor(i / 26)] + 'mLnwJoX'; // 11 letters, unique
+  return i % 3 === 0 ? c.slice(0, 10) + (i % 10) : c; // a third have a number, the rest only letters
+});
+const codedPage = (p) => {
+  const mine = p === 1 ? CODES.slice(0, 25) : CODES.slice(25);
+  const tiles = mine.map((c) => `<div class="item"><a href="/watch/${c}"><img src="/t/${c}.jpg" alt=""></a><a class="title" href="/watch/${c}">Clip ${c}</a></div>`).join('');
+  const pager = p === 1 ? '<div class="pagination"><span class="active">1</span><a href="/star/coded/?p=2">2</a><a class="next" href="/star/coded/?p=2">Next</a></div>' : '<div class="pagination"><a href="/star/coded/">1</a><span class="active">2</span></div>';
+  return `<!doctype html><html><head><title>Coded - Videos</title></head><body><h1>Coded</h1>${nav}<div class="list">${tiles}</div>${pager}</body></html>`;
+};
+const scriptedPage = () => `<!doctype html><html><head><title>Scripted</title></head><body><h1>Scripted</h1>${nav}<div class="list">` +
+  Array.from({ length: 6 }, (_, i) => `<div class="tile" data-href="/watch/scr${i}Xy"><img src="/t/s${i}.jpg" alt="Scripted ${i}"><span>Scripted ${i}</span></div>`).join('') + '</div></body></html>';
+const endlessPage = () => `<!doctype html><html><head><title>Endless</title></head><body><h1>Endless</h1>${nav}<div id="list" class="list"></div>
+<script>
+  let n = 0;
+  function more() { const l = document.getElementById('list'); for (let i = 0; i < 10 && n < 60; i++, n++) { const d = document.createElement('div'); d.className = 'item'; d.innerHTML = '<a href="/watch/end' + n + '"><img src="/t/e' + n + '.jpg" alt="End ' + n + '"></a>'; l.appendChild(d); } document.body.style.minHeight = (n * 200 + 1000) + 'px'; }
+  more();
+  window.addEventListener('scroll', () => { if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 50) setTimeout(more, 100); });
+</script></body></html>`;
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  if (u.pathname === '/star/coded/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(codedPage(Number(u.searchParams.get('p') || 1))); }
+  if (u.pathname === '/star/scripted/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(scriptedPage()); }
+  if (u.pathname === '/star/endless/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(endlessPage()); }
   const ck = u.pathname.match(/^\/channel\/checky\/(?:(\d+)\/)?$/);
   if (ck) {
     const p = Number(ck[1] || 1);
@@ -125,6 +149,22 @@ const server = http.createServer((req, res) => {
   let err;
   try { await crawl(driver, `${base}/channel/checkfirst/`, { politeMs: 20, scrolls: 1 }); } catch (e) { err = e; }
   assert.ok(err && err.siteCheck && /protected by Cloudflare/.test(err.message), String(err));
+
+  // ---- v1.2.5: code-style IDs (some without any number), two links per tile, two pages: 25 + 5.
+  const resA = await crawl(driver, `${base}/star/coded/`, { politeMs: 20, scrolls: 1 });
+  const gotA = new Set(resA.groups.flatMap((g) => g.items).map((v) => v.url.split('/').pop()));
+  for (const c of CODES) assert.ok(gotA.has(c), 'missing ' + c);
+  assert.equal(resA.groups.find((g) => /watch/.test(g.shape)).items.length, 30, 'all 30, including codes with no number: ' + JSON.stringify(resA.groups.map((g) => [g.shape, g.items.length])));
+  // ---- tiles made clickable by code (no normal links)
+  const resC = await crawl(driver, `${base}/star/scripted/`, { politeMs: 20, scrolls: 1 });
+  assert.equal(resC.groups.flatMap((g) => g.items).filter((v) => /\/watch\//.test(v.url)).length, 6, 'scripted tiles read');
+  // ---- endless scroll: 60 videos, 10 more each time you scroll to the bottom
+  const resD = await crawl(driver, `${base}/star/endless/`, { politeMs: 20, scrolls: 4 });
+  assert.equal(resD.groups.flatMap((g) => g.items).filter((v) => /\/watch\//.test(v.url)).length, 60, 'kept scrolling until nothing new');
+  // ---- the page limit: says so only when there really were more pages
+  const resE = await crawl(driver, `${base}/star/coded/`, { politeMs: 20, scrolls: 1, maxPages: 1 });
+  assert.equal(resE.hitPageLimit, true);
+  assert.equal(resA.hitPageLimit, false);
 
   await browser.close();
   server.close();

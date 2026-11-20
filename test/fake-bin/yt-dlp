@@ -84,6 +84,15 @@ if (!out) { console.error('ERROR: no output'); process.exit(2); }
 // fine when asked for like the page's player does (with the page as referer).
 if (/pagewin-site\.net/.test(url)) { console.error('ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)'); process.exit(1); }
 if (/needsreferer/.test(url) && !get('--referer')) { console.error('ERROR: unable to download video data: HTTP Error 403: Forbidden'); process.exit(1); }
+if (/ratelimited/.test(url)) { console.error('ERROR: [generic] x: Unable to download webpage: HTTP Error 429: Too Many Requests'); process.exit(1); }
+if (/unknownsite/.test(url)) { console.error('ERROR: Unsupported URL: ' + url); process.exit(1); }
+if (/longpreview/.test(url)) {
+  const outp = get('-o').replace('.%(ext)s', '.mp4');
+  fs.mkdirSync(path.dirname(outp), { recursive: true });
+  fs.writeFileSync(outp, 'preview');
+  console.log(`STDONE|${outp}|NA|NA|30|preview|Generic`);
+  process.exit(0);
+}
 if (/expiredlink/.test(url)) { console.error('ERROR: unable to download video data: HTTP Error 410: Gone'); process.exit(1); }
 
 const id = (url.match(/v=([^&]+)/) || [, 'x'])[1];

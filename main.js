@@ -75,7 +75,7 @@ const queue = new Queue({
   store: new JsonStore(path.join(dataDir, 'queue.json'), []),
   notify: { done: (it) => notifyDone(it), failed: (it) => notifyFailed(it) },
   sites,
-  resolveDirect: (url, { quiet } = {}) => grabDirect(url, { quiet })
+  resolveDirect: async (url, { quiet } = {}) => { const d = await grabDirect(url, { quiet }); delete d.grab; return d; }
 });
 const watch = new Watch({ store: new JsonStore(path.join(dataDir, 'watch.json'), { channels: [], lastRun: 0 }), prober, queue, library, getSettings: S, log, scanList: (url) => scanList(url) });
 
@@ -363,7 +363,7 @@ async function grabDirect(url, { quiet = false, useVisible = false } = {}) {
   const pass = await ensureBrowserPass(url);
   let g;
   try {
-    g = await grabMedia(url, { useVisible, log: quiet ? null : log });
+    g = await grabMedia(url, { useVisible, log: quiet ? null : log, solo: strictSite(url) });
   } catch (e) {
     if (e.siteCheck) {
       log.info('Page window: the site\'s check came up' + (pass.from ? ` (using the pass from ${pass.from === 'browser' ? 'your browser' : 'the page window'}${pass.expired ? ', which has expired' : ''})` : ' (no pass saved)'));
@@ -372,8 +372,15 @@ async function grabDirect(url, { quiet = false, useVisible = false } = {}) {
     }
     throw e;
   }
-  return { mediaUrl: g.media.url, referer: g.at || url, ua: g.ua, cookieFile: sites.writeDirectCookies(url, g.cookies), grab: g };
+  return {
+    mediaUrl: g.media.url, referer: g.at || url, ua: g.ua, cookieFile: sites.writeDirectCookies(url, g.cookies), grab: g,
+    // What the page says about the video: lets the queue fix up names and lengths before saving.
+    info: { title: cleanPageTitle(g.title, hostOf(url) || ''), duration: Number.isFinite(g.duration) ? Math.round(g.duration) : null, thumbnail: g.thumbnail || null }
+  };
 }
+
+// Strict sites (behind Cloudflare) get one page-window page at a time.
+function strictSite(url) { const e = sites.get(hostOf(url)); return !!(e && e.impersonate); }
 
 // The page window keeps cookies only in memory: after a restart, load the pass borrowed from the
 // user's browser back in (it's saved on disk for the engine). Also says if that pass has run out.
@@ -441,20 +448,44 @@ function ticketFor(result) {
   return result;
 }
 
-/** Look up one video; if its site refuses the engine even with a pass, go through the page window. */
+/**
+ * Look up one video. If its site refuses the engine even with a pass, or the engine doesn't know
+ * the site at all, go through the page window instead.
+ * opts.check: only checking whether this is a video page (Channel grab's test): no download details.
+ */
 async function lookupVideo(url, opts = {}) {
   const quiet = !!opts.private;
-  if (looksLikeVideo(url) && sites.needsWindow(url)) return grabVideo(url, { quiet, useVisible: opts.useVisible });
+  const viaWindow = () => (opts.check ? checkVideoPage(url, { quiet }) : grabVideo(url, { quiet, useVisible: opts.useVisible }));
+  if (looksLikeVideo(url) && sites.needsWindow(url)) return viaWindow();
   try {
     return await prober.lookup(url, { include: opts.include, quiet, cookiesBrowser: S().cookiesBrowser, onLine: (l) => send('lookup:line', l) });
   } catch (e) {
     if (looksLikeVideo(url) && sites.hasPass(url) && sites.isBlocked(url, e.message)) {
       log.info('The site refused the engine even with its pass: using the page window for its videos');
       sites.markNeedsWindow(url);
-      return grabVideo(url, { quiet, useVisible: opts.useVisible });
+      return viaWindow();
+    }
+    if (looksLikeVideo(url) && /Unsupported URL/i.test(e.message)) {
+      log.info('The engine doesn\'t know this site: trying the page window');
+      const r = await viaWindow();
+      sites.markNeedsWindow(url); // worked: this site's videos go through the page window
+      return r;
     }
     throw e;
   }
+}
+
+/** Channel grab's test: is this link the page of one video? (A proper player and a video file.) */
+async function checkVideoPage(url, { quiet } = {}) {
+  await ensureBrowserPass(url).catch(() => {});
+  const g = await grabMedia(url, { log: quiet ? null : log, solo: strictSite(url), check: true });
+  if (!g.videoPage) throw new Error('Not a video page (no main player)');
+  let host = '';
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+  const segs = (() => { try { return new URL(url).pathname.split('/').filter(Boolean); } catch { return []; } })();
+  return { kind: 'video', url, id: segs[segs.length - 1] || url, extractor: 'Generic', site: host, title: cleanPageTitle(g.title, host),
+    folder: cleanName(host || 'Other'), channelName: '', hasUploader: false, duration: Number.isFinite(g.duration) ? Math.round(g.duration) : null,
+    thumbnail: null, uploadDate: null, heights: g.media.height ? [g.media.height] : [], isLive: false, viaPage: true };
 }
 
 function logLookupFailure(e, opts) {
@@ -561,7 +592,7 @@ async function scanList(url, { quiet = false, visible = false } = {}) {
   }
   // Let the engine decide which links are this creator's videos.
   const chosen = await chooseVideos(scan, url, {
-    lookup: (u) => lookupVideo(u, { private: quiet }),
+    lookup: (u) => lookupVideo(u, { private: quiet, check: true }),
     follow: (items) => followLinks(items, { log, onProgress: opts.onProgress }),
     log: quiet ? null : log,
     onProgress: opts.onProgress,
@@ -594,6 +625,7 @@ async function scanList(url, { quiet = false, visible = false } = {}) {
   // The site's check came back partway: say how far the list goes.
   const note = scan.checkStoppedAt
     ? `The site's "are you human" check came back on page ${scan.checkStoppedAt}${scan.lastPage ? ' of ' + scan.lastPage : ''}, so this list only has pages 1–${scan.checkStoppedAt - 1}. Press "Open the page" to get past it, then scan again for the rest (videos you already have are skipped).`
+    : scan.hitPageLimit ? 'This channel has more than 200 pages: the list has the first 200. Videos you already have are skipped, so you can grab these and scan again later for more.'
     : null;
   return { kind: 'list', scanned: true, url, title: creatorName || scanName || folder, channelName: creatorName, folder, site: first.site, extractor: first.extractor, thumbnail: null, entries, note };
 }

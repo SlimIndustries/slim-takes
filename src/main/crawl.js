@@ -9,7 +9,8 @@ const { candidateGroups, nameFromUrl, summarise, COLLECT, AGE_CLICK, CLICK_NEXT,
 const countLinks = (all, url) => candidateGroups(all, url).reduce((n, g) => n + g.items.length, 0);
 const { cleanName } = require('./naming');
 
-const MAX_PAGES = 40;
+const MAX_PAGES = 200;
+const MAX_SCROLLS = 30; // endless-scroll pages: keep scrolling while new links appear, up to this many times
 function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // Is this the same page (ignoring #fragments and a trailing slash)?
@@ -40,10 +41,16 @@ async function readPage(driver, { log, quiet, scrolls = 4, state }) {
       }
     }
   }
-  // Let lazy-loading galleries fill in.
-  for (let i = 0; i < scrolls; i++) {
+  // Let lazy-loading galleries fill in. On endless-scroll pages, keep going while new links keep appearing.
+  const linkCount = () => driver.js('document.querySelectorAll("a[href]").length').catch(() => 0);
+  let seen = await linkCount();
+  let still = 0;
+  for (let i = 0; i < Math.max(scrolls, scrolls > 1 ? MAX_SCROLLS : scrolls); i++) {
     await driver.js('window.scrollTo(0, document.body ? document.body.scrollHeight : 0)').catch(() => {});
     await wait(scrolls > 1 ? 700 : 100);
+    if (i < scrolls - 1) continue;
+    const now = await linkCount();
+    if (now > seen) { seen = now; still = 0; } else if (++still >= 2) break; // nothing new twice in a row: done
   }
   const res = await driver.js(COLLECT);
   if (log && !quiet) log.info(`Page scan saw ${res.links.length} links. Most common kinds: ${summarise(res.links, res.at) || 'none'}`);
@@ -84,6 +91,7 @@ async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = f
   let empties = 0;       // pages in a row that added nothing
   let siteNum = null;    // the site's own number for the page just read
   let checkStoppedAt = null; // page where the site's check came back, if it did
+  let limitHit = false; // stopped only because of the page limit (there was a next page)
   for (let page = 1; page <= maxPages; page++) {
     const of = lastPage > page ? ` of ${lastPage}` : '';
     if (onProgress) onProgress(`Reading the page directly… page ${page}${of}`);
@@ -134,11 +142,12 @@ async function crawl(driver, startUrl, { log, onProgress, quiet, firstLoaded = f
       viaButton = true;
       await driver.settle(3000);
     } else break;
+    if (page === maxPages) limitHit = true; // (only reached when there was a next page to go to)
     await wait(politeMs); // be polite
   }
   const groups = candidateGroups(all, startUrl);
   if (log && !quiet) log.info('Page scan link groups: ' + (groups.slice(0, 10).map((g) => `${g.shape} (${g.items.length})`).join(', ') || 'none'));
-  return { groups, name: cleanName(name || nameFromUrl(startUrl) || '', null), checkStoppedAt, lastPage };
+  return { groups, name: cleanName(name || nameFromUrl(startUrl) || '', null), checkStoppedAt, lastPage, hitPageLimit: limitHit };
 }
 
 // ---------- tracking links ----------

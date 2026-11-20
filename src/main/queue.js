@@ -16,8 +16,11 @@ const { ensureDir, freeBytes } = require('./util');
 const ACTIVE = new Set(['starting', 'downloading', 'processing']);
 const FINISHED = new Set(['done', 'failed', 'skipped', 'canceled']);
 const DIRECT_STALE_MS = 30 * 60 * 1000;
-const NOTICE_DELAY_MS = 3000; // video links taken from a page: refresh after this long
+const NOTICE_DELAY_MS = 3000;
+const WINDOW_LANES = 2;              // page-window lookups at once (strict sites still one at a time)
+const SLOW_DOWN_MS = 5 * 60 * 1000;  // a site that says "too many requests": carry on after this long // video links taken from a page: refresh after this long
 const { hostOf } = require('./sites');
+const { looksLikeCode } = require('./scanlogic');
 /** A video page's own ID: the last part of its address (what the engine would call it too). */
 function pageId(url) { try { const p = new URL(url).pathname.split('/').filter(Boolean); return p[p.length - 1] || null; } catch { return null; } }
 const RECODE_HINT = /remux|recode|conversion failed|could not write header|Postprocessing|codec/i;
@@ -47,7 +50,9 @@ class Queue extends EventEmitter {
     // async (pageUrl, { quiet }) => { mediaUrl, referer, ua, cookieFile }: gets a video file from its page
     // for sites that refuse the engine. Optional.
     this.resolveDirect = resolveDirect || null;
-    this.resolvingNow = false;      // one page-window lookup at a time
+    this.resolvingNow = 0;          // page-window lookups running
+    this.resolveMs = 8000;          // how long one usually takes (for the time estimate)
+    this.slowDownMs = SLOW_DOWN_MS; // how long to wait when a site says "too many requests"
     this.heldHosts = new Set();     // sites whose downloads are waiting for a fresh pass
     this.engine = engine;
     this.library = library;
@@ -95,7 +100,7 @@ class Queue extends EventEmitter {
       thumbnail: i.thumbnail, status: i.status, pct: i.pct, speed: i.speed, eta: i.eta, downloaded: i.downloaded,
       total: i.total, error: i.error, note: i.note, filePath: i.filePath, private: !!i.private, attempts: i.attempts,
       isLive: !!i.isLive, source: i.source, addedAt: i.addedAt, finishedAt: i.finishedAt || null,
-      heldForPass: !!i.heldForPass
+      heldForPass: !!i.heldForPass, previewOnly: !!i.previewOnly
     };
   }
 
@@ -183,7 +188,7 @@ class Queue extends EventEmitter {
     if (!it) return;
     // A retry really retries: forget what was tried last time.
     it.attempts = 0; it.forceRecode = false;
-    it.cfRetried = false; it.directRetried = false; it.engineFallback = false; it.triedWindow = false;
+    it.cfRetried = false; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; it.windowError = null;
     this.resume(id);
   }
 
@@ -288,9 +293,11 @@ class Queue extends EventEmitter {
     }
     // Videos that come through the page window: one page at a time, without taking a download slot.
     const forWindow = this.items.filter((i) => i.status === 'waiting' && !i.resolving && this.needsPage(i) && !(i.retryAt > now));
-    if (!this.resolvingNow && forWindow.length) this.resolveNext(forWindow.shift());
+    while (this.resolvingNow < WINDOW_LANES && forWindow.length) this.resolveNext(forWindow.shift());
     forWindow.forEach((i, n) => {
-      const note = `Waiting for the page window (${n + 1} ahead)`;
+      const ahead = n + this.resolvingNow;
+      const secs = Math.round(((n + 1) * this.resolveMs) / WINDOW_LANES / 1000);
+      const note = `Waiting for the page window (${ahead} ahead, about ${secs < 90 ? secs + ' sec' : Math.round(secs / 60) + ' min'})`;
       if (i.note !== note) { i.note = note; this.changed(i); }
     });
 
@@ -329,26 +336,39 @@ class Queue extends EventEmitter {
   }
 
   resolveNext(it) {
-    this.resolvingNow = true;
+    this.resolvingNow++;
     it.resolving = true;
     it.triedWindow = true;
     it.note = 'Getting the video from its page…';
     this.changed(it);
+    const t0 = Date.now();
     this.resolveDirect(it.url, { quiet: it.private }).then((d) => {
+      this.resolveMs = Math.round(this.resolveMs * 0.7 + (Date.now() - t0) * 0.3);
       if (!this.items.includes(it)) return;
-      it.direct = { ...d, at: Date.now() };
+      const { info, ...direct } = d || {};
+      it.direct = { ...direct, at: Date.now() };
       it.needWindow = true;
+      // What the page says about the video: a real title instead of a code, and its length
+      // (so the duplicate check and the "preview only" check have it).
+      if (info) {
+        if (info.title && !it.base && looksLikeCode(it.title, it.url)) it.title = info.title;
+        if (info.duration) { it.pageDuration = info.duration; if (!it.duration) it.duration = info.duration; }
+        if (info.thumbnail && !it.thumbnail) it.thumbnail = info.thumbnail;
+      }
       if (it.status === 'waiting') it.note = null;
     }).catch((e) => {
       if (!this.items.includes(it) || it.status !== 'waiting') return;
       if (e.siteCheck || e.passExpired) return this.holdSite(it, e.message);
+      if (e.rateLimited) return this.holdSite(it, e.message, { note: 'Waiting: the site asked to slow down (carrying on in a few minutes)', autoResumeMs: this.slowDownMs });
+      if (e.final) return this.fail(it, e.message); // copy-protected, login only, page gone
       // The page window couldn't find the video: give the engine a go instead, once.
       this.log.warn(`${label(it)}: page window: ${it.private ? 'failed' : e.message}`);
+      it.windowError = e.message;
       it.engineFallback = true;
       it.note = null;
     }).finally(() => {
       it.resolving = false;
-      this.resolvingNow = false;
+      this.resolvingNow = Math.max(0, this.resolvingNow - 1);
       if (this.items.includes(it)) this.changed(it);
       this.pump();
     });
@@ -358,9 +378,8 @@ class Queue extends EventEmitter {
    * A site refused the download even with its pass: rather than fail its downloads one by one,
    * hold all of them until the user gets a fresh pass (then they carry on by themselves).
    */
-  holdSite(it, reason) {
+  holdSite(it, reason, { note = 'Waiting: this site needs a fresh pass', autoResumeMs = 0 } = {}) {
     const host = hostOf(it.url);
-    const note = 'Waiting: this site needs a fresh pass';
     let count = 0;
     for (const x of this.items) {
       if (hostOf(x.url) !== host) continue;
@@ -372,8 +391,14 @@ class Queue extends EventEmitter {
       }
     }
     this.persist();
-    this.log.warn(`Held ${count} download(s) from a site that needs a fresh pass` + (it.private ? '' : ` (${host})`));
-    if (!this.heldHosts.has(host)) {
+    this.log.warn(`Held ${count} download(s) from a site: ${note.replace(/^Waiting: /, '')}` + (it.private ? '' : ` (${host})`));
+    if (autoResumeMs) {
+      // Not the user's to fix: carry on by itself after a while.
+      clearTimeout((this.slowTimers || (this.slowTimers = new Map())).get(host));
+      const t = setTimeout(() => { this.slowTimers.delete(host); this.releaseSite(host); }, autoResumeMs);
+      if (t.unref) t.unref();
+      this.slowTimers.set(host, t);
+    } else if (!this.heldHosts.has(host)) {
       // Say so once, after a moment (downloads already running from the site usually join in).
       this.heldHosts.add(host);
       setTimeout(() => {
@@ -391,7 +416,7 @@ class Queue extends EventEmitter {
     for (const x of this.items) {
       if (x.heldForPass && hostOf(x.url) === host) {
         x.status = 'waiting'; x.heldForPass = false; x.note = null; x.error = null;
-        x.directRetried = false; x.engineFallback = false; x.cfRetried = false; x.triedWindow = false; x.attempts = 0;
+        x.directRetried = false; x.engineFallback = false; x.cfRetried = false; x.triedWindow = false; x.windowError = null; x.attempts = 0;
         n++;
         this.changed(x);
       }
@@ -584,6 +609,12 @@ class Queue extends EventEmitter {
     }
     const s = this.getSettings();
     it.attempts = (it.attempts || 0) + 1;
+    // The site says "too many requests": hold its downloads for a few minutes, then carry on.
+    if (/HTTP Error 429|Too Many Requests/i.test(message)) {
+      return this.holdSite(it, 'The site asked Slim Takes to slow down (too many requests).', { note: 'Waiting: the site asked to slow down (carrying on in a few minutes)', autoResumeMs: this.slowDownMs });
+    }
+    // The page window couldn't find it and the engine doesn't know the site: the window's reason is the useful one.
+    if (it.windowError && /Unsupported URL/i.test(message)) return this.fail(it, it.windowError);
     // A video file taken from its page was refused: links like that expire, so get a fresh one once.
     if (it.direct && /HTTP Error 4\d\d|Forbidden|expired/i.test(message)) {
       it.direct = null;
@@ -655,8 +686,25 @@ class Queue extends EventEmitter {
     this.sessionFinished++;
     this.notify.done(it);
     this.log.info(it.private ? 'Done: [private download]' : `Done: ${done.filepath}`);
+    if (it.direct && it.pageDuration) this.checkPreview(it, done);
     this.changed(it);
     this.pump();
+  }
+
+  /**
+   * A file taken from a page that's much shorter than the page says the video is: probably a preview
+   * (sites that only show full videos to logged-in members). Say so instead of quietly calling it done.
+   */
+  checkPreview(it, done) {
+    const fromEngine = Number(done.duration) > 0 ? Number(done.duration) : null;
+    const probe = fromEngine ? Promise.resolve(fromEngine) : (this.library.probeDuration ? Promise.resolve(this.library.probeDuration(done.filepath)) : Promise.resolve(null));
+    probe.then((secs) => {
+      if (!secs || !(it.pageDuration > 60) || secs >= it.pageDuration * 0.5) return;
+      it.previewOnly = true;
+      it.note = 'Looks like a preview only: this site may need you to be logged in for the full video';
+      this.log.warn(`${label(it)}: only ${Math.round(secs)}s of ${it.pageDuration}s, probably a preview`);
+      this.changed(it);
+    }).catch(() => {});
   }
 
   release(it) {

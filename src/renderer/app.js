@@ -596,7 +596,7 @@ function queueRow(it) {
     else detail = [it.total ? `${fmtBytes(it.downloaded)} of ${fmtBytes(it.total)}` : null, it.speed ? fmtBytes(it.speed) + '/s' : null, fmtEta(it.eta)].filter(Boolean).join(' · ');
     if (it.note) detail = it.note + (detail ? ' · ' + detail : '');
   } else if (it.status === 'waiting') detail = it.note || 'Waiting for a free slot';
-  else if (it.status === 'done') detail = it.filePath ? it.filePath : 'Saved';
+  else if (it.status === 'done') detail = (it.note ? it.note + ' · ' : '') + (it.filePath ? it.filePath : 'Saved');
   else if (it.status === 'skipped') detail = it.note || 'Skipped';
   else if (it.status === 'paused') detail = it.note || 'Paused — will continue where it left off';
   else if (it.status === 'canceled') detail = 'Canceled';

@@ -2,7 +2,7 @@
 const { chromium } = require('/opt/npm-tools/node_modules/playwright');
 const http = require('http');
 const assert = require('assert');
-const { MEDIA_PROBE, mediaProbe, pickMedia, cleanPageTitle } = require('../../src/main/scanlogic');
+const { MEDIA_PROBE, mediaProbe, pickMedia, cleanPageTitle, isVideoPage, explainNoMedia } = require('../../src/main/scanlogic');
 
 const page = `<!doctype html><html><head><title>Clip Title - Example</title>
 <meta property="og:title" content="Clip Title - Example">
@@ -22,7 +22,17 @@ const framed = `<!doctype html><html><head><title>Framed</title></head><body><h1
 <iframe src="/embed/9" width="640" height="360"></iframe>
 <button class="vjs-big-play-button" onclick="window.clicked = true">Play</button></body></html>`;
 const embed = `<!doctype html><html><body><video src="/media/framed_720p.mp4" width="640" height="360"></video></body></html>`;
+const listPage = `<!doctype html><html><head><title>Jimmy The Lawn Guy - Videos</title></head><body><h1>Jimmy The Lawn Guy</h1>
+<div class="hero"><video src="/previews/hero.mp4" width="240" height="135" autoplay muted loop></video></div>
+<div class="list"><a href="/watch/aPmEvq2pjlW"><img src="/t/1.jpg" alt="Clip One"></a></div></body></html>`;
+const withRelated = `<!doctype html><html><head><title>Main Clip</title></head><body>
+<video src="/media/main_1080p.mp4" width="960" height="540"></video>
+<div class="related"><video src="/media/other_1080p.mp4" width="200" height="112"></video></div></body></html>`;
+const membersOnly = `<!doctype html><html><head><title>Members Clip</title></head><body><h1>Members Clip</h1>
+<div class="gate"><p>This video is for members only. Sign in to watch.</p><form><input type="email"><input type="password"></form></div></body></html>`;
 const server = http.createServer((req, res) => {
+  const pages = { '/list/jimmy': listPage, '/watch/related': withRelated, '/watch/members': membersOnly };
+  if (pages[req.url]) { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(pages[req.url]); }
   if (req.url === '/video/1/clip-title/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(page); }
   if (req.url === '/video/9/framed/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(framed); }
   if (req.url === '/embed/9') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(embed); }
@@ -51,6 +61,22 @@ const server = http.createServer((req, res) => {
   const frame = p.frames().find((f) => /\/embed\/9$/.test(f.url()));
   const inner = await frame.evaluate(MEDIA_PROBE);
   assert.equal(pickMedia([...top.out, ...inner.out], []).url, base + '/media/framed_720p.mp4');
+
+  // A list page with a small autoplaying banner is not a video page.
+  await p.goto(base + '/list/jimmy');
+  const lp = await p.evaluate(mediaProbe(false));
+  assert.equal(isVideoPage(lp), false, 'list page with a banner: not a video page');
+  // Only the main player counts: the small "related" player is ignored.
+  await p.goto(base + '/watch/related');
+  const rp = await p.evaluate(mediaProbe(false));
+  assert.ok(isVideoPage(rp));
+  assert.deepEqual([...new Set(rp.out.map((c) => c.url))], [base + '/media/main_1080p.mp4'], 'related player ignored');
+  // A members-only page: no video, and the reason is the login wall.
+  await p.goto(base + '/watch/members');
+  const mp = await p.evaluate(mediaProbe(false));
+  assert.equal(mp.out.length, 0);
+  assert.ok(mp.loginWall);
+  assert.match(explainNoMedia(mp, []).message, /logged in/);
 
   await browser.close();
   server.close();

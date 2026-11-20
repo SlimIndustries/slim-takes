@@ -601,3 +601,135 @@ test('a video link from the page that has gone stale is refreshed before downloa
   assert.equal(calls.length, 1, 'fetched a fresh link first');
   assert.ok(sites);
 });
+
+// ---------- v1.2.4 stress tests: the page-window route for sites the engine doesn't know ----------
+function unknownSite(s, { media = 'https://cdn.mediahost.example/v/main_720p.mp4', info = {}, delay = 0, fail = null } = {}) {
+  const sites = withSites(s);
+  sites.markNeedsWindow('https://unknownsite.example/');
+  const calls = [];
+  let running = 0, peak = 0;
+  s.queue.resolveDirect = async (url) => {
+    calls.push(url);
+    running++; peak = Math.max(peak, running);
+    try {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
+      if (fail) { const e = fail(url, calls.length); if (e) throw e; }
+      const id = url.split('/').filter(Boolean).pop();
+      return { mediaUrl: typeof media === 'function' ? media(url) : media, referer: url, ua: 'UA', cookieFile: null,
+        info: { title: info.title === undefined ? 'Real Title ' + id : info.title, duration: info.duration || null, thumbnail: null } };
+    } finally { running--; }
+  };
+  return { sites, calls, peak: () => peak };
+}
+
+test('unknown site: code-like titles become the page\'s real title, and the length is filled in', async () => {
+  const s = setup();
+  unknownSite(s, { info: { title: 'Jimmy Cuts Grass Again', duration: 61 } });
+  s.queue.add({ url: 'https://unknownsite.example/watch/aPmEvq2pjlW', title: 'aPmEvq2pjlW', folder: 'Jimmy The Lawn Guy', extractor: 'Generic' });
+  s.queue.add({ url: 'https://unknownsite.example/watch/keepme', title: 'A Proper Title', folder: 'Jimmy The Lawn Guy', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed'].includes(x.status)));
+  const a = list.find((x) => /aPmEvq2pjlW/.test(x.url));
+  assert.equal(a.status, 'done');
+  assert.equal(a.title, 'Jimmy Cuts Grass Again');
+  assert.match(a.filePath, /Jimmy The Lawn Guy[\\/]Jimmy Cuts Grass Again\.mp4$/);
+  assert.equal(list.find((x) => /keepme/.test(x.url)).title, 'A Proper Title', 'real titles are left alone');
+});
+
+test('unknown site: a short preview instead of the full video is flagged, not quietly called done', async () => {
+  const s = setup();
+  unknownSite(s, { media: 'https://cdn.mediahost.example/v/longpreview.mp4', info: { title: 'Long Video', duration: 1800 } });
+  s.queue.add({ url: 'https://unknownsite.example/watch/long1', title: 'Long Video', folder: 'F', extractor: 'Generic' });
+  await waitFor(s.queue, (l) => l[0].status === 'done');
+  const list = await waitFor(s.queue, (l) => l[0].previewOnly, 3000);
+  assert.match(list[0].note, /preview only/);
+});
+
+test('unknown site: copy-protected or login-only videos fail straight away with a clear reason (no engine attempt)', async () => {
+  const s = setup();
+  unknownSite(s, { fail: (url) => Object.assign(new Error(/drm/.test(url) ? 'This video is copy-protected (DRM), so it can\'t be downloaded.' : 'This video needs you to be logged in on the site, so Slim Takes can\'t get it.'), { final: true }) });
+  s.queue.add({ url: 'https://unknownsite.example/watch/drm1', title: 'Protected', folder: 'F', extractor: 'Generic' });
+  s.queue.add({ url: 'https://unknownsite.example/watch/members1', title: 'Members', folder: 'F', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'failed'));
+  assert.match(list.find((x) => x.title === 'Protected').error, /copy-protected/);
+  assert.match(list.find((x) => x.title === 'Members').error, /logged in/);
+});
+
+test('unknown site: page window finds nothing and the engine doesn\'t know the site: the window\'s reason is shown', async () => {
+  const s = setup();
+  const sites = withSites(s);
+  sites.markNeedsWindow('https://unknownsite.example/');
+  s.queue.resolveDirect = async () => { throw new Error('Couldn\'t find the video on that page.'); };
+  s.queue.add({ url: 'https://unknownsite.example/watch/nothing', title: 'Nothing', folder: 'F', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => ['failed', 'done'].includes(l[0].status));
+  assert.equal(list[0].status, 'failed');
+  assert.match(list[0].error, /Couldn't find the video/);
+});
+
+test('rate limits: the site\'s downloads wait, then carry on by themselves (page window and engine)', async () => {
+  const s = setup();
+  s.queue.slowDownMs = 400;
+  let refused = 0;
+  unknownSite(s, { fail: () => (refused++ < 1 ? Object.assign(new Error('The site asked Slim Takes to slow down (too many requests).'), { rateLimited: true }) : null) });
+  for (let i = 0; i < 3; i++) s.queue.add({ url: `https://unknownsite.example/watch/r${i}`, title: 'R ' + i, folder: 'F', extractor: 'Generic' });
+  await waitFor(s.queue, (l) => l.some((x) => /slow down/.test(x.note || '')));
+  const list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'done'), 15000);
+  assert.equal(list.length, 3);
+  // the engine saying 429
+  const s2 = setup({ retries: 3 });
+  withSites(s2);
+  s2.queue.slowDownMs = 60000;
+  s2.queue.resolveDirect = async () => ({ mediaUrl: 'x' });
+  s2.queue.add({ url: 'https://www.example.com/watch?v=ratelimited', title: 'Busy', folder: 'F', extractor: 'Generic' });
+  const l2 = await waitFor(s2.queue, (l) => l[0].status === 'paused' || l[0].status === 'failed');
+  assert.equal(l2[0].status, 'paused');
+  assert.match(l2[0].note, /slow down/);
+  assert.equal(l2[0].attempts, 1, 'no pointless quick retries');
+});
+
+test('stress: two page-window lookups at once, never more; other sites keep downloading meanwhile', async () => {
+  const s = setup({ concurrent: 3 });
+  const u = unknownSite(s, { delay: 120 });
+  for (let i = 0; i < 12; i++) s.queue.add({ url: `https://unknownsite.example/watch/p${i}`, title: 'P ' + i, folder: 'F', extractor: 'Generic' });
+  for (let i = 0; i < 4; i++) s.queue.add({ url: `https://www.youtube.com/watch?v=yt${i}`, title: 'YT ' + i, folder: 'Y', extractor: 'Youtube' });
+  const t0 = Date.now();
+  const list = await waitFor(s.queue, (l) => l.length === 16 && l.every((x) => x.status === 'done'), 30000);
+  assert.equal(u.peak(), 2, 'two page-window lookups at once at most');
+  assert.equal(u.calls.length, 12);
+  assert.ok(Date.now() - t0 < 12 * 120, 'faster than one at a time');
+  assert.equal(s.queue.resolvingNow, 0, 'nothing left counted as running');
+  assert.ok(list.filter((x) => /YT/.test(x.title)).every((x) => x.status === 'done'));
+});
+
+test('stress: 150 videos through the page window with pause, resume and cancel in the middle', async () => {
+  const s = setup({ concurrent: 4 });
+  unknownSite(s, { delay: 3 });
+  for (let i = 0; i < 150; i++) s.queue.add({ url: `https://unknownsite.example/watch/bulk${i}`, title: 'Bulk ' + i, folder: 'Bulk', extractor: 'Generic' });
+  await waitFor(s.queue, (l) => l.filter((x) => x.status === 'done').length >= 20, 30000);
+  s.queue.pauseAll();
+  await new Promise((r) => setTimeout(r, 300));
+  const pausedAt = s.queue.list().filter((x) => x.status === 'done').length;
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(s.queue.list().filter((x) => x.status === 'done').length <= pausedAt + 4, 'pause stops new downloads');
+  s.queue.resumeAll();
+  await waitFor(s.queue, (l) => l.filter((x) => x.status === 'done').length >= 80, 30000);
+  const canceled = s.queue.cancelAll();
+  assert.ok(canceled > 0);
+  const list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'done'), 15000);
+  assert.ok(list.length >= 80 && list.length < 150, `kept ${list.length} finished`);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(s.queue.resolvingNow, 0, 'no page-window lookups left hanging');
+  assert.ok(s.queue.list().every((x) => x.status === 'done'), 'nothing new started after Cancel all');
+  const names = new Set(list.map((x) => x.filePath));
+  assert.equal(names.size, list.length, 'every file got its own name');
+});
+
+test('stress: a restart mid-way keeps page-window downloads (but not half-finished lookups)', async () => {
+  const s = setup({ concurrent: 1 });
+  unknownSite(s, { delay: 200 });
+  for (let i = 0; i < 4; i++) s.queue.add({ url: `https://unknownsite.example/watch/rs${i}`, title: 'RS ' + i, folder: 'F', extractor: 'Generic' });
+  await new Promise((r) => setTimeout(r, 100));
+  s.queue.persist();
+  const saved = s.queue.store.get();
+  assert.ok(saved.length >= 3);
+  assert.ok(saved.every((x) => x.resolving === undefined), 'a lookup in progress is not saved as running');
+});
