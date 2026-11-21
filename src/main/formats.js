@@ -90,6 +90,8 @@ function buildArgs(opts) {
   if (opts.maxDuration) filters.push(`duration<=${Number(opts.maxDuration)}`);
   if (filters.length) args.push('--match-filter', filters.join(' & '));
   if (opts.polite) args.push('--sleep-requests', '1');
+  // Streams come in pieces: fetch several at once (sites often slow each connection down).
+  if (opts.concurrentFragments > 1) args.push('--concurrent-fragments', String(Math.min(16, opts.concurrentFragments)));
   if (opts.ffmpegDir) args.push('--ffmpeg-location', opts.ffmpegDir);
 
   return args;

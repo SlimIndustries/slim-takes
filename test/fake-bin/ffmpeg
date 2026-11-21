@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Test stand-in: runs the real ffmpeg if this machine has one (so format conversions are really tested).
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const real = ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((p) => fs.existsSync(p));
+if (!real) { console.error('no ffmpeg on this machine'); process.exit(1); }
+const r = spawnSync(real, process.argv.slice(2), { stdio: 'inherit' });
+process.exit(r.status == null ? 1 : r.status);

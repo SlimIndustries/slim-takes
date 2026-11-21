@@ -23,7 +23,8 @@ function setup(extra = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'stq-'));
   process.env.FAKE_STATE_DIR = tmp;
   const log = { info() {}, warn() {}, error() {} };
-  const settings = { ...settingsMod.defaults(tmp), polite: false, retries: 2, minFreeGB: 0, ...extra };
+  // (connections: 1 keeps the older tests on the engine route; the multi-connection tests turn it on.)
+  const settings = { ...settingsMod.defaults(tmp), polite: false, retries: 2, minFreeGB: 0, connections: 1, ...extra };
   const engine = new Engine({ dir: tmp, log });
   const library = new Library({ storeFile: path.join(tmp, 'lib.json'), probeDuration: (f) => engine.probeDuration(f), log });
   const history = new History(new JsonStore(path.join(tmp, 'history.json'), []));
@@ -635,13 +636,15 @@ test('unknown site: code-like titles become the page\'s real title, and the leng
   assert.equal(list.find((x) => /keepme/.test(x.url)).title, 'A Proper Title', 'real titles are left alone');
 });
 
-test('unknown site: a short preview instead of the full video is flagged, not quietly called done', async () => {
+test('unknown site: a short preview instead of the full video is not kept (deleted, fresh link tried once)', async () => {
   const s = setup();
-  unknownSite(s, { media: 'https://cdn.mediahost.example/v/longpreview.mp4', info: { title: 'Long Video', duration: 1800 } });
+  const u = unknownSite(s, { media: 'https://cdn.mediahost.example/v/longpreview.mp4', info: { title: 'Long Video', duration: 1800 } });
   s.queue.add({ url: 'https://unknownsite.example/watch/long1', title: 'Long Video', folder: 'F', extractor: 'Generic' });
-  await waitFor(s.queue, (l) => l[0].status === 'done');
-  const list = await waitFor(s.queue, (l) => l[0].previewOnly, 3000);
-  assert.match(list[0].note, /preview only/);
+  const list = await waitFor(s.queue, (l) => ['failed', 'paused', 'done'].includes(l[0].status));
+  assert.notEqual(list[0].status, 'done', 'a 30-second file for a 30-minute video is not "done"');
+  assert.match(list[0].error, /preview or trailer/);
+  assert.equal(u.calls.length, 2, 'one fresh link was tried');
+  assert.deepEqual(filesIn(path.join(s.settings.folder, 'F')), [], 'the preview was deleted');
 });
 
 test('unknown site: copy-protected or login-only videos fail straight away with a clear reason (no engine attempt)', async () => {
@@ -732,4 +735,225 @@ test('stress: a restart mid-way keeps page-window downloads (but not half-finish
   const saved = s.queue.store.get();
   assert.ok(saved.length >= 3);
   assert.ok(saved.every((x) => x.resolving === undefined), 'a lookup in progress is not saved as running');
+});
+
+// ---------- v1.2.6: web pages instead of videos ----------
+const htmlRuns = (s) => { try { return fs.readFileSync(path.join(s.tmp, 'html-runs.txt'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } };
+const filesIn = (dir) => { const out = []; const walk = (d) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, f.name); if (f.isDirectory()) walk(p); else out.push(p); } }; try { walk(dir); } catch { /* none */ } return out; };
+
+test('the reported case: a 50-video channel where every "video" is a web page stops after 2, no conversions, no junk left', async () => {
+  const s = setup({ concurrent: 3, retries: 2 });
+  const notices = [];
+  s.queue.on('notVideos', (n) => notices.push(n));
+  for (let i = 0; i < 50; i++) s.queue.add({ url: `https://pagesite.example/watch?v=htmlpage${i}`, title: 'Clip ' + i, folder: 'Channel', extractor: 'Generic', videoId: 'h' + i });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['failed', 'paused', 'done'].includes(x.status)), 20000);
+  const runs = htmlRuns(s);
+  assert.ok(runs.length <= 4, `stopped early: only ${runs.length} downloads tried (not 50, not 150)`);
+  assert.equal(new Set(runs).size, runs.length, 'no video was retried or "converted instead"');
+  assert.ok(list.filter((x) => x.status === 'paused').length >= 46, 'the rest of the channel is paused, not attempted');
+  assert.ok(list.filter((x) => x.status === 'paused').every((x) => /web pages instead of videos/.test(x.note)));
+  assert.ok(list.some((x) => /web page instead of the video/.test(x.error || '')), 'clear reason shown');
+  await new Promise((r) => setTimeout(r, 3500));
+  assert.equal(notices.length, 1, 'one notice');
+  const left = filesIn(path.join(s.settings.folder, 'Channel'));
+  assert.deepEqual(left, [], 'no fake .mp4 or .part files left behind');
+});
+
+test('a web page the engine called a success is still caught and deleted', async () => {
+  const s = setup();
+  s.queue.add({ url: 'https://pagesite.example/watch?v=htmlok1', title: 'Looks Fine', folder: 'C2', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => ['failed', 'done', 'paused'].includes(l[0].status));
+  assert.equal(list[0].status, 'failed');
+  assert.deepEqual(filesIn(path.join(s.settings.folder, 'C2')), []);
+});
+
+test('page window: a decoy link that serves a web page gets one fresh link, then downloads; one good video resets the count', async () => {
+  const s = setup();
+  const sites = withSites(s);
+  sites.markNeedsWindow('https://decoy.example/');
+  let n = 0;
+  s.queue.resolveDirect = async (url) => ({ mediaUrl: n++ === 0 ? 'https://cdn.decoy.example/v/htmlpage.mp4' : 'https://cdn.mediahost.example/v/good_720p.mp4', referer: url, ua: 'UA', cookieFile: null });
+  s.queue.add({ url: 'https://decoy.example/watch/one', title: 'One', folder: 'D', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => ['failed', 'done', 'paused'].includes(l[0].status));
+  assert.equal(list[0].status, 'done', JSON.stringify(list[0]));
+  assert.equal(n, 2);
+  assert.equal(s.queue.badStreak.get('decoy.example') || 0, 0, 'a good video resets the count');
+});
+
+test('page window says every link was a decoy: counts toward stopping the site', async () => {
+  const s = setup();
+  const sites = withSites(s);
+  sites.markNeedsWindow('https://decoys.example/');
+  s.queue.resolveDirect = async () => { throw Object.assign(new Error('The video links on that page all led to web pages, not videos.'), { notVideo: true }); };
+  for (let i = 0; i < 6; i++) s.queue.add({ url: `https://decoys.example/watch/d${i}`, title: 'D ' + i, folder: 'D', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['failed', 'paused', 'done'].includes(x.status)));
+  assert.ok(list.filter((x) => x.status === 'failed').length <= 2);
+  assert.ok(list.filter((x) => x.status === 'paused').length >= 4);
+});
+
+test('subtitles and covers next to a failed download are never mistaken for web pages', () => {
+  const s = setup();
+  const dir = path.join(s.tmp, 'subs');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'Clip.en.vtt'), 'WEBVTT\n\n00:00.000 --> 00:01.000\nHello');
+  fs.writeFileSync(path.join(dir, 'Clip.info.json'), '{"a":1}');
+  fs.writeFileSync(path.join(dir, 'Clip.mp4.part'), Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]));
+  assert.deepEqual(s.queue.leftoverPages({ dir, base: 'Clip' }), [], 'real video piece and text side files: nothing flagged');
+  fs.writeFileSync(path.join(dir, 'Clip.mp4.part'), '<!DOCTYPE html><html><head><title>x</title></head></html>');
+  assert.equal(s.queue.leftoverPages({ dir, base: 'Clip' }).length, 1);
+});
+
+test('normal downloads still work exactly as before (no false alarms)', async () => {
+  const s = setup({ concurrent: 3 });
+  for (let i = 0; i < 12; i++) s.queue.add({ url: `https://www.youtube.com/watch?v=normal${i}`, title: 'Normal ' + i, folder: 'N', extractor: 'Youtube' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['failed', 'paused', 'done'].includes(x.status)));
+  assert.ok(list.every((x) => x.status === 'done'));
+});
+
+// ---------- v1.2.7: the engine's link is a decoy -> the page window takes over ----------
+function junkSite(s, { media = 'https://cdn.mediahost.example/v/real_720p.mp4' } = {}) {
+  const sites = withSites(s);
+  const calls = [];
+  s.queue.resolveDirect = async (url) => { calls.push(url); return { mediaUrl: typeof media === 'function' ? media(url, calls.length) : media, referer: url, ua: 'UA', cookieFile: null }; };
+  return { sites, calls };
+}
+
+test('the reported site, full size: 290 videos where the engine only gets web pages all download through the page window', async () => {
+  const s = setup({ concurrent: 3, retries: 2 });
+  const { sites, calls } = junkSite(s);
+  const paused = [];
+  s.queue.on('notVideos', (n) => paused.push(n));
+  for (let i = 0; i < 290; i++) s.queue.add({ url: `https://junksite.example/video/v${i}`, title: 'Clip ' + i, folder: 'junksite.example', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed', 'paused'].includes(x.status)), 120000);
+  assert.equal(list.filter((x) => x.status === 'done').length, 290, 'all 290 downloaded');
+  const engineJunk = htmlRuns(s);
+  assert.ok(engineJunk.length <= 3, `only the first ${engineJunk.length} went to the engine, then the site switched over`);
+  assert.equal(calls.length, 290, 'every video came through the page window');
+  assert.ok(sites.needsWindow('https://junksite.example/'));
+  assert.equal(paused.length, 0, 'nothing paused');
+  const files = filesIn(path.join(s.settings.folder, 'junksite.example'));
+  assert.equal(files.length, 290);
+  assert.ok(files.every((f) => /\.mp4$/.test(f) && fs.readFileSync(f).subarray(4, 8).toString() === 'ftyp'), 'every file is a real video, no web pages');
+});
+
+test('a site where even the page window only gets web pages still stops after 2 (no endless churn)', async () => {
+  const s = setup({ concurrent: 3 });
+  junkSite(s, { media: (url) => 'https://cdn.junk-media.example/v/htmlpage-' + url.split('/').pop() + '.mp4' });
+  const paused = [];
+  s.queue.on('notVideos', (n) => paused.push(n));
+  for (let i = 0; i < 40; i++) s.queue.add({ url: `https://junksite.example/video/w${i}`, title: 'W ' + i, folder: 'J', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed', 'paused'].includes(x.status)), 30000);
+  const tries = htmlRuns(s).length;
+  assert.ok(tries <= 8, `stopped early (${tries} attempts for 40 videos)`);
+  assert.ok(list.filter((x) => x.status === 'paused').length >= 34);
+  await new Promise((r) => setTimeout(r, 3500));
+  assert.equal(paused.length, 1, 'one notice');
+  assert.deepEqual(filesIn(path.join(s.settings.folder, 'J')), [], 'no junk left');
+});
+
+test('mixed queue: a decoy site switching over doesn\'t touch other sites (they download exactly as before)', async () => {
+  const s = setup({ concurrent: 3 });
+  const { sites, calls } = junkSite(s);
+  for (let i = 0; i < 20; i++) {
+    s.queue.add({ url: `https://junksite.example/video/m${i}`, title: 'Junk ' + i, folder: 'JS', extractor: 'Generic' });
+    s.queue.add({ url: `https://www.youtube.com/watch?v=mix${i}`, title: 'Tube ' + i, folder: 'YT', extractor: 'Youtube' });
+  }
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed', 'paused'].includes(x.status)), 60000);
+  assert.ok(list.every((x) => x.status === 'done'), JSON.stringify(list.filter((x) => x.status !== 'done').slice(0, 2)));
+  assert.ok(!calls.some((u) => /youtube/.test(u)), 'YouTube never went near the page window');
+  assert.ok(!sites.needsWindow('https://www.youtube.com/'), 'only the decoy site was switched');
+  const tube = filesIn(path.join(s.settings.folder, 'YT'));
+  assert.equal(tube.length, 20);
+});
+
+test('paused videos from before get the page window when resumed', async () => {
+  const s = setup({ concurrent: 2 });
+  const { calls } = junkSite(s);
+  // what the reported run left behind: videos held after web pages came back
+  for (let i = 0; i < 5; i++) s.queue.add({ url: `https://junksite.example/video/old${i}`, title: 'Old ' + i, folder: 'O', extractor: 'Generic' });
+  s.queue.pauseAll();
+  for (const it of s.queue.items) { it.status = 'paused'; it.heldForPass = true; it.note = 'Paused: this site is sending web pages instead of videos'; }
+  s.queue.resumeAll();
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed', 'paused'].includes(x.status)), 30000);
+  assert.ok(list.every((x) => x.status === 'done'));
+  assert.ok(calls.length >= 4);
+});
+
+
+// ---------- v1.2.8 ----------
+test('a channel that only gives previews pauses after 2 (no folder full of trailers)', async () => {
+  const s = setup({ concurrent: 3 });
+  unknownSite(s, { media: 'https://cdn.mediahost.example/v/longpreview.mp4', info: { title: 'Long', duration: 1800 } });
+  const notes = [];
+  s.queue.on('onlyPreviews', (n) => notes.push(n));
+  for (let i = 0; i < 40; i++) s.queue.add({ url: `https://unknownsite.example/watch/pv${i}`, title: 'Long ' + i, folder: 'PV', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['failed', 'paused', 'done'].includes(x.status)), 30000);
+  assert.equal(list.filter((x) => x.status === 'done').length, 0);
+  assert.ok(list.filter((x) => x.status === 'paused').length >= 34, 'the rest paused');
+  await new Promise((r) => setTimeout(r, 3500));
+  assert.equal(notes.length, 1);
+  assert.deepEqual(filesIn(path.join(s.settings.folder, 'PV')), [], 'no previews left behind');
+});
+
+test('genuinely short videos are kept (the preview rule only applies to videos over 2 minutes)', async () => {
+  const s = setup();
+  unknownSite(s, { media: 'https://cdn.mediahost.example/v/longpreview.mp4', info: { title: 'Short Clip', duration: 30 } });
+  s.queue.add({ url: 'https://unknownsite.example/watch/short1', title: 'Short Clip', folder: 'S', extractor: 'Generic' });
+  const list = await waitFor(s.queue, (l) => ['failed', 'paused', 'done'].includes(l[0].status));
+  assert.equal(list[0].status, 'done');
+});
+
+test('a video without sound is flagged, not quietly kept as fine', async () => {
+  const s = setup();
+  unknownSite(s, { media: 'https://cdn.mediahost.example/v/a.mp4?v=nosound1' });
+  s.queue.add({ url: 'https://unknownsite.example/watch/ns1', title: 'Silent', folder: 'NS', extractor: 'Generic' });
+  await waitFor(s.queue, (l) => l[0].status === 'done');
+  const list = await waitFor(s.queue, (l) => /No sound/.test(l[0].note || ''), 3000);
+  assert.match(list[0].note, /sends the sound separately/);
+});
+
+test('links are only fetched for videos about to start (they can expire while waiting)', async () => {
+  const s = setup({ concurrent: 2 });
+  const u = unknownSite(s, { delay: 20 });
+  s.queue.resolveDirect = ((orig) => async (url, o) => { await new Promise((r) => setTimeout(r, 5)); return orig(url, o); })(s.queue.resolveDirect);
+  let maxAhead = 0;
+  s.queue.on('item', () => {
+    const ahead = s.queue.items.filter((i) => i.status === 'waiting' && i.direct).length;
+    maxAhead = Math.max(maxAhead, ahead);
+  });
+  for (let i = 0; i < 30; i++) s.queue.add({ url: `https://unknownsite.example/watch/jit${i}`, title: 'JIT ' + i, folder: 'J', extractor: 'Generic' });
+  await waitFor(s.queue, (l) => l.every((x) => x.status === 'done'), 30000);
+  assert.ok(maxAhead <= 2, `at most ${maxAhead} links fetched ahead (not all 30)`);
+  assert.equal(u.calls.length, 30);
+});
+
+test('plain messages for engine errors, with an "Update engine" hint where it helps', () => {
+  const { friendlyError } = require('../src/main/queue');
+  assert.match(friendlyError('[Example] assets: Failed to parse JSON (caused by JSONDecodeError("Expecting value")); please report this issue on https://github.com/yt-dlp/yt-dlp/issues'), /data couldn't be read.*Update engine/);
+  assert.match(friendlyError('This video is not available in your country'), /isn't available in your country/);
+  assert.match(friendlyError('ERROR: [x] room is currently offline'), /offline right now/);
+  const s = setup();
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=fail1', title: 'X', folder: 'X' });
+  s.queue.fail(s.queue.items[0], 'Failed to parse JSON (caused by JSONDecodeError)');
+  assert.equal(s.queue.list()[0].updateHint, true);
+});
+
+test('very long titles in deep folders still fit Windows\' path limit', () => {
+  const { fitToPath } = require('../src/main/naming');
+  const dir = 'C:\\Users\\someone\\Videos\\SlimTakes\\' + 'A Very Long Creator Folder Name '.repeat(3).trim();
+  const title = '[Studio] Someone, Someone Else - A Very Long Title With Lots Of Words [' + 'Tag, '.repeat(60) + 'HD]';
+  const base = fitToPath(dir, title, 'mp4');
+  assert.ok((dir + '\\' + base + '.mp4.part').length < 260, 'fits: ' + (dir + '\\' + base).length);
+  assert.ok(base.length > 20, 'still a readable name');
+});
+
+test('Resume right after Pause (while downloads are still stopping) really resumes them', async () => {
+  const s = setup({ concurrent: 3 });
+  for (let i = 0; i < 3; i++) s.queue.add({ url: `https://www.youtube.com/watch?v=slowpause${i}`, title: 'SP ' + i, folder: 'SP' });
+  await waitFor(s.queue, (l) => l.filter((x) => x.status === 'downloading').length === 3);
+  s.queue.pauseAll();
+  s.queue.resumeAll(); // straight away, before the downloads have finished stopping
+  const list = await waitFor(s.queue, (l) => l.every((x) => ['downloading', 'starting', 'waiting'].includes(x.status)) && !s.queue.paused, 5000);
+  assert.ok(list.every((x) => x.status !== 'paused'), JSON.stringify(list.map((x) => x.status)));
+  s.queue.cancelAll();
 });

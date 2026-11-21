@@ -18,9 +18,28 @@ const FINISHED = new Set(['done', 'failed', 'skipped', 'canceled']);
 const DIRECT_STALE_MS = 30 * 60 * 1000;
 const NOTICE_DELAY_MS = 3000;
 const WINDOW_LANES = 2;              // page-window lookups at once (strict sites still one at a time)
-const SLOW_DOWN_MS = 5 * 60 * 1000;  // a site that says "too many requests": carry on after this long // video links taken from a page: refresh after this long
+const SLOW_DOWN_MS = 5 * 60 * 1000;
+const NOT_VIDEO_STOP = 2;             // web pages instead of videos from one site, in a row, before its downloads are paused
+const NOT_VIDEO_MSG = 'The site sent a web page instead of the video. It may need you to be logged in, or it refused the video link.';  // a site that says "too many requests": carry on after this long // video links taken from a page: refresh after this long
 const { hostOf } = require('./sites');
-const { looksLikeCode } = require('./scanlogic');
+const { looksLikeCode, sniffMedia } = require('./scanlogic');
+const { fastGet, isStreamUrl, stateFile, serverLimit, serverOf } = require('./fastget');
+const { packageFile } = require('./package');
+/** Is this file a web page (or other text) rather than a video? Reads only its first bytes. */
+function isNotVideo(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(1024);
+    const n = fs.readSync(fd, buf, 0, 1024, 0);
+    if (!n) return false;
+    const kind = sniffMedia(buf.subarray(0, n));
+    if (kind === 'html') return true;
+    // Other plain text only counts when the file is small (error messages), never a big file.
+    return kind === 'text' && fs.fstatSync(fd).size < 2 * 1024 * 1024;
+  } catch { return false; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ } }
+}
+
 /** A video page's own ID: the last part of its address (what the engine would call it too). */
 function pageId(url) { try { const p = new URL(url).pathname.split('/').filter(Boolean); return p[p.length - 1] || null; } catch { return null; } }
 const RECODE_HINT = /remux|recode|conversion failed|could not write header|Postprocessing|codec/i;
@@ -35,6 +54,7 @@ function scrub(it, msg) {
 
 function killTree(child) {
   if (!child || child.exitCode !== null) return;
+  if (child.fast) { child.kill(); return; } // a multi-connection download (not a separate program)
   if (process.platform === 'win32') {
     // yt-dlp may have started ffmpeg; take the whole family down.
     execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {});
@@ -53,7 +73,9 @@ class Queue extends EventEmitter {
     this.resolvingNow = 0;          // page-window lookups running
     this.resolveMs = 8000;          // how long one usually takes (for the time estimate)
     this.slowDownMs = SLOW_DOWN_MS; // how long to wait when a site says "too many requests"
+    this.busyMaxMs = 180000;        // how long one download waits for a busy video server before trying again later
     this.heldHosts = new Set();     // sites whose downloads are waiting for a fresh pass
+    this.badStreak = new Map();     // site -> web pages received instead of videos, in a row
     this.engine = engine;
     this.library = library;
     this.getSettings = getSettings;
@@ -100,7 +122,7 @@ class Queue extends EventEmitter {
       thumbnail: i.thumbnail, status: i.status, pct: i.pct, speed: i.speed, eta: i.eta, downloaded: i.downloaded,
       total: i.total, error: i.error, note: i.note, filePath: i.filePath, private: !!i.private, attempts: i.attempts,
       isLive: !!i.isLive, source: i.source, addedAt: i.addedAt, finishedAt: i.finishedAt || null,
-      heldForPass: !!i.heldForPass, previewOnly: !!i.previewOnly
+      heldForPass: !!i.heldForPass, previewOnly: !!i.previewOnly, updateHint: !!i.updateHint
     };
   }
 
@@ -174,10 +196,11 @@ class Queue extends EventEmitter {
 
   resume(id) {
     const it = this.find(id);
+    if (it && it.stopReason === 'pause' && this.procs.has(it.id)) { it.resumeAfterStop = true; return; }
     if (it && (it.status === 'paused' || it.status === 'failed' || it.status === 'canceled')) {
       if (it.status !== 'paused') it.attempts = 0;
       it.status = 'waiting'; it.error = null; it.note = null; it.retryAt = 0;
-      if (it.heldForPass) { it.heldForPass = false; this.heldHosts.delete(hostOf(it.url)); }
+      if (it.heldForPass) { it.heldForPass = false; this.heldHosts.delete(hostOf(it.url)); this.badStreak.delete(hostOf(it.url)); }
       if (this.paused) { this.paused = false; this.emit('state'); }
       this.changed(it); this.pump();
     }
@@ -188,7 +211,8 @@ class Queue extends EventEmitter {
     if (!it) return;
     // A retry really retries: forget what was tried last time.
     it.attempts = 0; it.forceRecode = false;
-    it.cfRetried = false; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; it.windowError = null;
+    it.cfRetried = false; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; it.windowError = null; it.fastFailed = false;
+    it.busyTries = 0; it.retryAt = 0;
     this.resume(id);
   }
 
@@ -196,13 +220,14 @@ class Queue extends EventEmitter {
     const it = this.find(id);
     if (!it) return;
     if (ACTIVE.has(it.status)) { it.stopReason = 'cancel'; killTree(this.procs.get(id)); }
-    else if (!FINISHED.has(it.status)) { it.status = 'canceled'; this.release(it); this.changed(it); }
+    else if (!FINISHED.has(it.status)) { it.status = 'canceled'; this.dropKept(it); this.release(it); this.changed(it); }
   }
 
   remove(id) {
     const it = this.find(id);
     if (!it) return;
     if (ACTIVE.has(it.status)) { it.removeAfter = true; this.cancel(id); return; }
+    if (!FINISHED.has(it.status)) this.dropKept(it);
     this.release(it);
     this.items = this.items.filter((x) => x !== it);
     this.persist();
@@ -213,7 +238,7 @@ class Queue extends EventEmitter {
   cancelAll() {
     const waiting = this.items.filter((i) => !FINISHED.has(i.status) && !ACTIVE.has(i.status));
     const active = this.items.filter((i) => ACTIVE.has(i.status));
-    for (const it of waiting) this.release(it);
+    for (const it of waiting) { this.dropKept(it); this.release(it); }
     this.items = this.items.filter((i) => !waiting.includes(i));
     for (const it of active) { it.removeAfter = true; this.cancel(it.id); }
     this.persist();
@@ -257,11 +282,14 @@ class Queue extends EventEmitter {
   resumeAll() {
     this.paused = false;
     for (const it of this.items) {
+      // Still stopping from a pause a moment ago: carry on once it has stopped.
+      if (it.stopReason === 'pause' && this.procs.has(it.id)) { it.resumeAfterStop = true; continue; }
       if (it.status !== 'paused') continue;
       it.status = 'waiting';
       if (it.heldForPass) { it.heldForPass = false; it.note = null; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; }
     }
     this.heldHosts.clear();
+    this.badStreak.clear();
     this.persist();
     this.emit('list');
     this.emit('state');
@@ -269,6 +297,8 @@ class Queue extends EventEmitter {
   }
 
   stopAllForQuit() {
+    this.quitting = true; // nothing new starts, and stopped downloads aren't counted as failures
+    for (const it of this.items) if (ACTIVE.has(it.status) && this.procs.has(it.id)) it.stopReason = 'quit';
     for (const [, child] of this.procs) killTree(child);
     for (const it of this.items) if (ACTIVE.has(it.status)) it.status = 'waiting';
     this.persist();
@@ -280,7 +310,7 @@ class Queue extends EventEmitter {
   // ---------- running ----------
   pump() {
     clearTimeout(this.pumpTimer);
-    if (this.paused) return;
+    if (this.paused || this.quitting) return;
     const s = this.getSettings();
     const limit = Math.max(1, Math.min(8, Number(s.concurrent) || 3));
     let running = this.items.filter((i) => ACTIVE.has(i.status)).length;
@@ -293,7 +323,9 @@ class Queue extends EventEmitter {
     }
     // Videos that come through the page window: one page at a time, without taking a download slot.
     const forWindow = this.items.filter((i) => i.status === 'waiting' && !i.resolving && this.needsPage(i) && !(i.retryAt > now));
-    while (this.resolvingNow < WINDOW_LANES && forWindow.length) this.resolveNext(forWindow.shift());
+    // Only fetch links for videos about to start (links can expire while waiting for a download slot).
+    const ready = this.items.filter((i) => i.status === 'waiting' && i.direct && !i.resolving).length;
+    while (this.resolvingNow < WINDOW_LANES && ready + this.resolvingNow < limit && forWindow.length) this.resolveNext(forWindow.shift());
     forWindow.forEach((i, n) => {
       const ahead = n + this.resolvingNow;
       const secs = Math.round(((n + 1) * this.resolveMs) / WINDOW_LANES / 1000);
@@ -306,6 +338,8 @@ class Queue extends EventEmitter {
       if (it.status !== 'waiting') continue;
       if (it.resolving || this.needsPage(it)) continue;
       if (it.retryAt && it.retryAt > now) { soonest = Math.min(soonest, it.retryAt - now); continue; }
+      // Its video server already has as many downloads as it allows: start something else, come back to this.
+      if (this.serverFull(it)) { soonest = Math.min(soonest, 2000); continue; }
       if (s.polite) {
         const last = this.lastStartBySite[it.site] || 0;
         const gap = 3000 + Math.floor(Math.random() * 3000);
@@ -327,6 +361,83 @@ class Queue extends EventEmitter {
     }
     if (soonest !== Infinity) this.pumpTimer = setTimeout(() => this.pump(), Math.min(soonest + 50, 60000));
     this.checkIdle();
+  }
+
+  /** Download a video file from a page over several connections, then package it in the chosen format. */
+  async startFast(it, connections) {
+    const ctl = new AbortController();
+    const job = { fast: true, pid: null, exitCode: null, kill: () => ctl.abort() };
+    this.procs.set(it.id, job);
+    it.status = 'downloading';
+    it.note = null;
+    this.changed(it);
+    const say = it.private ? null : (m) => this.log.info(`${label(it)}: ${m}`);
+    if (!it.private) this.log.info(`Start: ${it.title} -> ${path.join(it.folder, it.base)}.${finalExt(it.format)} (up to ${connections} connections)`);
+    else this.log.info('Start: [private download]');
+    const part = path.join(it.dir, it.base + '.fast.part');
+    const server = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return null; } };
+    let lastEmit = 0;
+    try {
+      const r = await fastGet(it.direct.mediaUrl, part, {
+        headersFor: (u) => this.sites.directHeaders(it.direct, u),
+        connections,
+        learnedLimit: this.sites.fastLimit(server(it.direct.mediaUrl)),
+        mirrors: it.direct.alternates || [],
+        keepOnStop: true, // pausing (or closing the app) keeps what's done
+        busyMaxMs: this.busyMaxMs,
+        // The link ran out partway: get a fresh one from the page and carry on.
+        refresh: this.resolveDirect ? async () => {
+          const d = await this.resolveDirect(it.url, { quiet: it.private });
+          if (!d || !d.mediaUrl || it.stopReason) return null;
+          const { info, ...direct } = d;
+          it.direct = { ...direct, at: Date.now() };
+          return d.mediaUrl;
+        } : null,
+        signal: ctl.signal,
+        log: say,
+        onProgress: (p) => {
+          it.downloaded = p.downloaded;
+          it.total = p.total || null;
+          it.speed = p.speed;
+          it.pct = p.total ? Math.min(99.9, (p.downloaded / p.total) * 100) : 0;
+          it.eta = p.total && p.speed ? Math.round((p.total - p.downloaded) / p.speed) : null;
+          const now = Date.now();
+          if (now - lastEmit > 500) { lastEmit = now; this.emit('item', this.view(it)); }
+        }
+      });
+      // Remember how many connections this server took, so next time starts there (no refusals).
+      if (r.limit) this.sites.setFastLimit(server(it.direct.mediaUrl), r.limit);
+      if (it.stopReason) throw Object.assign(new Error('Stopped'), { aborted: true });
+      it.status = 'processing';
+      it.speed = null; it.eta = null;
+      this.changed(it);
+      const file = await packageFile(part, path.join(it.dir, it.base), finalExt(it.format), this.engine.ffmpeg, { log: say });
+      job.exitCode = 0;
+      if (say) {
+        const mins = Math.floor(r.seconds / 60), secs = Math.round(r.seconds % 60);
+        const from = r.servers.length > 1 ? ` from ${r.servers.length} servers (${r.servers.map((x) => x.server + ' ' + x.mb + ' MB').join(', ')})` : '';
+        say(`${Math.round(r.total / 1e6)} MB in ${mins ? mins + 'm ' : ''}${secs}s, ${(r.speed / 1e6).toFixed(1)} MB/s, ${r.connections} connection${r.connections === 1 ? '' : 's'} at once${from}${r.resumedFrom ? `, carried on from ${Math.round(r.resumedFrom / 1e6)} MB` : ''}`);
+      }
+      return this.finishRun(it, 0, { done: { filepath: file, duration: null, id: it.videoId, extractor: it.extractor, timestamp: null, uploadDate: null }, errors: [], skipped: null });
+    } catch (e) {
+      job.exitCode = 1;
+      const forget = () => { for (const f of [part, stateFile(part)]) { try { fs.unlinkSync(f); } catch { /* none */ } } };
+      // Paused or closing: keep what's done (canceling deletes it, in finishRun).
+      if (it.stopReason || e.aborted) return this.finishRun(it, 1, { done: null, errors: [], skipped: null });
+      this.procs.delete(it.id);
+      if (e.notVideo) { forget(); return this.notVideo(it, []); }
+      // The video server is busy (it allows only a few downloads at once): try this one again shortly.
+      // What's done is kept. Never the engine (it would get the same answer) and never the whole site held.
+      if (e.busy || e.rateLimited || e.status === 503 || e.status === 429) return this.busyLater(it);
+      // Kept for carrying on: an expired link (a fresh one is fetched).
+      if (e.expired || e.status === 403 || e.status === 404 || e.status === 410) return this.finishRun(it, 1, { done: null, errors: [`HTTP Error ${e.status || 403}`], skipped: null });
+      // Anything else: do it the engine's way instead (one connection), once.
+      forget();
+      this.log.warn(`${label(it)}: multi-connection download didn't work (${it.private ? 'private' : e.message}); using the engine instead`);
+      it.fastFailed = true;
+      it.status = 'waiting'; it.note = null;
+      this.changed(it); this.pump();
+    }
   }
 
   /** Does this download need its video link from the page window first? */
@@ -361,6 +472,7 @@ class Queue extends EventEmitter {
       if (e.siteCheck || e.passExpired) return this.holdSite(it, e.message);
       if (e.rateLimited) return this.holdSite(it, e.message, { note: 'Waiting: the site asked to slow down (carrying on in a few minutes)', autoResumeMs: this.slowDownMs });
       if (e.final) return this.fail(it, e.message); // copy-protected, login only, page gone
+      if (e.notVideo) return this.notVideo(it, []);  // every link on the page led to a web page
       // The page window couldn't find the video: give the engine a go instead, once.
       this.log.warn(`${label(it)}: page window: ${it.private ? 'failed' : e.message}`);
       it.windowError = e.message;
@@ -378,7 +490,7 @@ class Queue extends EventEmitter {
    * A site refused the download even with its pass: rather than fail its downloads one by one,
    * hold all of them until the user gets a fresh pass (then they carry on by themselves).
    */
-  holdSite(it, reason, { note = 'Waiting: this site needs a fresh pass', autoResumeMs = 0 } = {}) {
+  holdSite(it, reason, { note = 'Waiting: this site needs a fresh pass', autoResumeMs = 0, event = 'needsPass' } = {}) {
     const host = hostOf(it.url);
     let count = 0;
     for (const x of this.items) {
@@ -403,7 +515,7 @@ class Queue extends EventEmitter {
       this.heldHosts.add(host);
       setTimeout(() => {
         const held = this.items.filter((x) => x.heldForPass && hostOf(x.url) === host);
-        if (held.length) this.emit('needsPass', { host, count: held.length, private: held.every((x) => x.private) });
+        if (held.length) this.emit(event, { host, count: held.length, private: held.every((x) => x.private) });
       }, NOTICE_DELAY_MS).unref?.();
     }
     this.pump();
@@ -422,6 +534,7 @@ class Queue extends EventEmitter {
       }
     }
     this.heldHosts.delete(host);
+    this.badStreak.delete(host);
     if (n) { this.persist(); this.pump(); }
     return n;
   }
@@ -461,6 +574,12 @@ class Queue extends EventEmitter {
     }
 
     const concurrent = Math.max(1, Number(s.concurrent) || 3);
+    const connections = Math.max(1, Math.min(16, Number(s.connections) || 8));
+    // A single video file from a page: fetch it over several connections (sites often slow each one down).
+    // Streams, speed limits and anything that failed this way go through the engine as before.
+    if (it.direct && !isStreamUrl(it.direct.mediaUrl) && connections > 1 && !s.speedLimitMB && !it.fastFailed && this.sites) {
+      return this.startFast(it, connections);
+    }
     const opts = {
       format: it.format,
       quality: it.quality,
@@ -477,7 +596,8 @@ class Queue extends EventEmitter {
       minDuration: it.filters && it.filters.minDuration,
       maxDuration: it.filters && it.filters.maxDuration,
       polite: s.polite,
-      forceRecode: it.forceRecode
+      forceRecode: it.forceRecode,
+      concurrentFragments: connections // streams: fetch several pieces at once
     };
     const out = path.join(it.dir, escapeTemplate(it.base)) + '.%(ext)s';
     const args = [
@@ -569,6 +689,13 @@ class Queue extends EventEmitter {
     it.stopReason = null;
     it.speed = null; it.eta = null;
 
+    if (reason === 'quit') { it.status = 'waiting'; it.note = null; return; } // carries on next time
+    if (reason === 'pause' && it.resumeAfterStop) {
+      it.resumeAfterStop = false;
+      it.status = 'waiting'; it.note = null;
+      this.changed(it); this.pump();
+      return;
+    }
     if (reason === 'pause') {
       it.status = 'paused'; it.note = null;
       this.changed(it); this.pump();
@@ -583,6 +710,14 @@ class Queue extends EventEmitter {
       this.pump();
       return;
     }
+    // What came down is a web page, not a video? Never package it, convert it or retry it blindly.
+    if (code === 0 && state.done && isNotVideo(state.done.filepath)) return this.notVideo(it, [state.done.filepath]);
+    if (code !== 0) {
+      const junk = this.leftoverPages(it);
+      if (junk.length) return this.notVideo(it, junk);
+    }
+    // A file from a page that's far shorter than the video: a preview or trailer, not the video.
+    if (code === 0 && state.done && it.direct && it.pageDuration > 120) return this.checkFullLength(it, state.done);
     if (code === 0 && state.done) return this.complete(it, state.done);
     if (code === 0 && state.skipped) {
       it.status = 'skipped';
@@ -592,6 +727,8 @@ class Queue extends EventEmitter {
       return;
     }
     const message = state.errors[state.errors.length - 1] || (code === 0 ? 'Finished without a file' : `Engine stopped (code ${code})`);
+    // A video file from a page, and its server said "busy": try again shortly (not a failure, not the whole site).
+    if (it.direct && /HTTP Error 503|Service (Temporarily )?Unavailable/i.test(message)) return this.busyLater(it);
     // Some streams can't be repackaged into MOV/WebM/MP4: convert instead, once.
     if (!it.forceRecode && !isAudio(it.format) && it.format !== 'mkv' && RECODE_HINT.test(message)) {
       this.log.warn(`${label(it)}: repackaging failed, converting instead`);
@@ -651,10 +788,37 @@ class Queue extends EventEmitter {
     this.fail(it, message);
   }
 
+  /** The server holding a video's file is busy: wait a bit, then try again (a few times, getting longer). */
+  busyLater(it) {
+    this.procs.delete(it.id);
+    it.busyTries = (it.busyTries || 0) + 1;
+    if (it.busyTries > 10) return this.fail(it, 'The video server stayed busy for a long time (it allows only a few downloads at once). Try again later.');
+    const wait = Math.min(300000, 15000 * it.busyTries);
+    it.retryAt = Date.now() + wait;
+    it.status = 'waiting';
+    it.speed = null; it.eta = null;
+    it.note = `Waiting: the video server is busy (trying again in ${wait < 90000 ? Math.round(wait / 1000) + ' sec' : Math.round(wait / 60000) + ' min'})`;
+    if (!it.private) this.log.info(`${label(it)}: the video server is busy, trying again in ${Math.round(wait / 1000)}s (what's done is kept)`);
+    this.changed(it);
+    this.pump();
+  }
+
+  /** Is the server holding this video's file already running as many downloads as it allows? */
+  serverFull(it) {
+    if (!it.direct || !it.direct.mediaUrl || isStreamUrl(it.direct.mediaUrl)) return false;
+    const server = serverOf(it.direct.mediaUrl);
+    const limit = serverLimit(server) || (this.sites && this.sites.fastLimit(server));
+    if (!limit) return false;
+    const running = this.items.filter((x) => ACTIVE.has(x.status) && x !== it && x.direct && x.direct.mediaUrl && serverOf(x.direct.mediaUrl) === server).length;
+    return running >= limit;
+  }
+
   fail(it, message) {
     this.procs.delete(it.id);
+    this.dropKept(it);
     it.status = 'failed';
     it.error = friendlyError(message);
+    it.updateHint = /needs an update|Update the engine/i.test(it.error);
     it.note = null;
     this.release(it);
     this.log.error(`Failed: ${label(it)}: ${it.private ? 'see app' : message}`);
@@ -665,6 +829,7 @@ class Queue extends EventEmitter {
   }
 
   complete(it, done) {
+    this.badStreak.delete(hostOf(it.url));
     it.status = 'done';
     it.pct = 100;
     it.note = null;
@@ -686,23 +851,51 @@ class Queue extends EventEmitter {
     this.sessionFinished++;
     this.notify.done(it);
     this.log.info(it.private ? 'Done: [private download]' : `Done: ${done.filepath}`);
-    if (it.direct && it.pageDuration) this.checkPreview(it, done);
+    if (it.direct) this.checkSound(it, done.filepath);
     this.changed(it);
     this.pump();
   }
 
   /**
-   * A file taken from a page that's much shorter than the page says the video is: probably a preview
-   * (sites that only show full videos to logged-in members). Say so instead of quietly calling it done.
+   * A file taken from a page, checked against the video's length shown on the page before it's kept.
+   * Much shorter = a preview or trailer: deleted, retried once with a fresh link, and two in a row
+   * pause the site's downloads (no channels full of trailers).
    */
-  checkPreview(it, done) {
+  checkFullLength(it, done) {
     const fromEngine = Number(done.duration) > 0 ? Number(done.duration) : null;
-    const probe = fromEngine ? Promise.resolve(fromEngine) : (this.library.probeDuration ? Promise.resolve(this.library.probeDuration(done.filepath)) : Promise.resolve(null));
+    const probe = fromEngine ? Promise.resolve(fromEngine) : Promise.resolve(this.library.probeDuration ? this.library.probeDuration(done.filepath) : null).catch(() => null);
     probe.then((secs) => {
-      if (!secs || !(it.pageDuration > 60) || secs >= it.pageDuration * 0.5) return;
-      it.previewOnly = true;
-      it.note = 'Looks like a preview only: this site may need you to be logged in for the full video';
-      this.log.warn(`${label(it)}: only ${Math.round(secs)}s of ${it.pageDuration}s, probably a preview`);
+      if (secs && secs < it.pageDuration * 0.5) return this.previewOnly(it, done.filepath, secs);
+      this.complete(it, done);
+    });
+  }
+
+  previewOnly(it, file, secs) {
+    try { fs.unlinkSync(file); } catch { /* in use */ }
+    this.cleanupParts(it);
+    const host = hostOf(it.url);
+    const streak = (this.badStreak.get(host) || 0) + 1;
+    this.badStreak.set(host, streak);
+    this.log.warn(`${label(it)}: only ${Math.round(secs)}s of a ${it.pageDuration}s video: a preview, not kept (${streak} in a row)`);
+    const msg = 'Only a preview or trailer was available, not the full video. This site may need you to be logged in.';
+    if (streak >= NOT_VIDEO_STOP) return this.holdSite(it, msg, { note: 'Paused: this site is only giving previews, not full videos', event: 'onlyPreviews' });
+    if (this.resolveDirect && !it.directRetried) {
+      it.direct = null; it.directRetried = true; it.needWindow = true;
+      it.status = 'waiting'; it.note = 'Got a preview: getting another link from the page…';
+      this.changed(it); this.pump();
+      return;
+    }
+    return this.fail(it, msg);
+  }
+
+  /** Videos whose page sends the sound separately come out silent: say so instead of quietly keeping them. */
+  checkSound(it, file) {
+    if (!this.engine || !this.engine.hasAudio || /\.(m4a|mp3|flac|wav|opus|ogg|aac)$/i.test(file)) return;
+    Promise.resolve(this.engine.hasAudio(file)).then((has) => {
+      if (has !== false) return;
+      it.note = 'No sound: this site sends the sound separately';
+      it.noSound = true;
+      this.log.warn(`${label(it)}: the file has no sound`);
       this.changed(it);
     }).catch(() => {});
   }
@@ -713,11 +906,72 @@ class Queue extends EventEmitter {
     it.dir = null;
   }
 
+  /** Files this download left behind that are web pages, not video (what sites send instead of a refused video). */
+  leftoverPages(it) {
+    if (!it.dir || !it.base) return [];
+    const out = [];
+    try {
+      for (const f of fs.readdirSync(it.dir)) {
+        if (!f.startsWith(it.base + '.')) continue;
+        // Only the video file and its pieces (not subtitles, covers or info files saved beside it).
+        if (!/\.(mp4|m4v|mkv|webm|mov|avi|flv|ts|m4a|mp3|aac|flac|wav|opus|ogg|part|ytdl|temp)(-Frag\d+)?$/i.test(f)) continue;
+        const p = path.join(it.dir, f);
+        if (isNotVideo(p)) out.push(p);
+      }
+    } catch { /* folder gone */ }
+    return out;
+  }
+
+  /**
+   * A web page came down instead of the video: delete it and say so plainly. A link found on the
+   * page gets one fresh try; and if a site does this twice in a row, its other downloads are paused
+   * instead of going through the same thing hundreds of times.
+   */
+  notVideo(it, files) {
+    for (const f of files || []) { try { fs.unlinkSync(f); } catch { /* in use */ } }
+    this.cleanupParts(it);
+    const host = hostOf(it.url);
+    // The engine's link led to a web page (sites can carry decoy links). Before counting it against
+    // the site, try the page window: it checks every link and skips decoys. The site's other videos
+    // go that way too.
+    if (!it.direct && this.resolveDirect && !it.triedWindow && !it.engineFallback) {
+      if (this.sites) this.sites.markNeedsWindow(it.url);
+      it.needWindow = true;
+      it.status = 'waiting'; it.note = 'The site sent a web page: trying the page window instead…';
+      this.log.warn(`${label(it)}: the engine got a web page instead of the video; using the page window for this site`);
+      this.changed(it); this.pump();
+      return;
+    }
+    const streak = (this.badStreak.get(host) || 0) + 1;
+    this.badStreak.set(host, streak);
+    this.log.warn(`${label(it)}: the site sent a web page instead of the video (${streak} in a row)`);
+    if (streak >= NOT_VIDEO_STOP) {
+      return this.holdSite(it, NOT_VIDEO_MSG, { note: 'Paused: this site is sending web pages instead of videos', event: 'notVideos' });
+    }
+    if (it.direct && this.resolveDirect && !it.directRetried) {
+      it.direct = null;
+      it.directRetried = true;
+      it.needWindow = true;
+      it.status = 'waiting'; it.note = 'The video link led to a web page: getting another from the page…';
+      this.changed(it); this.pump();
+      return;
+    }
+    it.attempts = (it.attempts || 0) + 1;
+    return this.fail(it, NOT_VIDEO_MSG);
+  }
+
+  /** A half-done multi-connection download kept for carrying on: gone once the item is given up on. */
+  dropKept(it) {
+    if (!it.dir || !it.base) return;
+    const part = path.join(it.dir, it.base + '.fast.part');
+    for (const f of [part, stateFile(part)]) { try { fs.unlinkSync(f); } catch { /* none */ } }
+  }
+
   cleanupParts(it) {
     if (!it.dir || !it.base) return;
     try {
       for (const f of fs.readdirSync(it.dir)) {
-        if (f.startsWith(it.base + '.') && /\.(part|ytdl|temp)(-Frag\d+)?$|\.f\d+\.\w+(\.part)?$/.test(f)) {
+        if (f.startsWith(it.base + '.') && /\.(part|ytdl|temp)(-Frag\d+)?$|\.f\d+\.\w+(\.part)?$|\.fast\.part\.json$/.test(f)) {
           try { fs.unlinkSync(path.join(it.dir, f)); } catch { /* in use */ }
         }
       }
@@ -750,6 +1004,9 @@ function friendlyError(msg) {
   if (/Private video|members-only|This video is private/i.test(m)) return 'Private or members-only video.';
   if (/Video unavailable|has been removed|no longer available/i.test(m)) return 'Video unavailable or removed.';
   if (/DRM/i.test(m)) return 'This video is copy-protected (DRM) and can\'t be downloaded.';
+  if (/not available (in|from) your (country|location)|geo.?restrict|blocked in your country/i.test(m)) return 'This video isn\'t available in your country.';
+  if (/is (currently )?offline|not currently live|room is (currently )?offline|stream (has )?ended|is not live/i.test(m)) return 'This stream is offline right now.';
+  if (/Failed to parse JSON|please report this issue|Unable to extract|Unable to find|KeyError|unexpected (response|data)/i.test(m)) return 'The site\'s data couldn\'t be read: the stream may be offline, or the download engine needs an update. Press "Update engine", then Retry.';
   if (/Unsupported URL/i.test(m)) return 'This site or link isn\'t supported.';
   if (/HTTP Error 429|Too Many Requests/i.test(m)) return 'The site is limiting downloads right now. Polite mode helps; try again later.';
   if (/HTTP Error 403/i.test(m)) return 'The site refused the download (403). Update the engine in Settings and retry.';

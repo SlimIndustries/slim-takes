@@ -2,7 +2,7 @@
 const { chromium } = require('/opt/npm-tools/node_modules/playwright');
 const http = require('http');
 const assert = require('assert');
-const { MEDIA_PROBE, mediaProbe, pickMedia, cleanPageTitle, isVideoPage, explainNoMedia } = require('../../src/main/scanlogic');
+const { MEDIA_PROBE, mediaProbe, pickMedia, rankMedia, firstRealMedia, cleanPageTitle, isVideoPage, explainNoMedia } = require('../../src/main/scanlogic');
 
 const page = `<!doctype html><html><head><title>Clip Title - Example</title>
 <meta property="og:title" content="Clip Title - Example">
@@ -30,7 +30,16 @@ const withRelated = `<!doctype html><html><head><title>Main Clip</title></head><
 <div class="related"><video src="/media/other_1080p.mp4" width="200" height="112"></video></div></body></html>`;
 const membersOnly = `<!doctype html><html><head><title>Members Clip</title></head><body><h1>Members Clip</h1>
 <div class="gate"><p>This video is for members only. Sign in to watch.</p><form><input type="email"><input type="password"></form></div></body></html>`;
+// A page whose code carries a decoy 1080p link (it leads back to the channel page), while the player plays the real file.
+const decoyPage = `<!doctype html><html><head><title>Decoy Clip</title></head><body><h1>Decoy Clip</h1>
+<video src="/media/real_720p.mp4" width="960" height="540"></video>
+<script>var cfg = {"hd":"http:\\/\\/127.0.0.1:PORT\\/get_file\\/abc_1080p.mp4"};</script></body></html>`;
+const realMp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(5000, 7)]);
 const server = http.createServer((req, res) => {
+  if (req.url === '/watch/decoy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(decoyPage.replace('PORT', server.address().port)); }
+  if (req.url === '/get_file/abc_1080p.mp4') { res.writeHead(302, { Location: '/channel/someone/' }); return res.end(); }
+  if (req.url === '/channel/someone/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end('<!DOCTYPE html><html><head><title>Someone - Videos</title></head><body>list</body></html>'); }
+  if (req.url === '/media/real_720p.mp4') { res.writeHead(200, { 'Content-Type': 'video/mp4' }); return res.end(realMp4); }
   const pages = { '/list/jimmy': listPage, '/watch/related': withRelated, '/watch/members': membersOnly };
   if (pages[req.url]) { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(pages[req.url]); }
   if (req.url === '/video/1/clip-title/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(page); }
@@ -77,6 +86,16 @@ const server = http.createServer((req, res) => {
   assert.equal(mp.out.length, 0);
   assert.ok(mp.loginWall);
   assert.match(explainNoMedia(mp, []).message, /logged in/);
+
+  // The reported problem: a decoy link in the page's code that serves a web page. It ranks first
+  // (it says 1080p), but the first-bytes check skips it and the real file is used.
+  await p.goto(base + '/watch/decoy');
+  const dp = await p.evaluate(mediaProbe(false));
+  const ranked = rankMedia(dp.out, []);
+  assert.match(ranked[0].url, /abc_1080p/, 'the decoy looks best on paper');
+  const fetchStart = async (u) => { const r = await fetch(u, { headers: { Range: 'bytes=0-4095' } }); return { bytes: new Uint8Array(await r.arrayBuffer()).slice(0, 4096), type: r.headers.get('content-type') || '' }; };
+  const real = await firstRealMedia(ranked, fetchStart);
+  assert.equal(real.url, base + '/media/real_720p.mp4', 'the real video is used, not the decoy');
 
   await browser.close();
   server.close();

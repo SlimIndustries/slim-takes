@@ -84,12 +84,23 @@ if (!out) { console.error('ERROR: no output'); process.exit(2); }
 // fine when asked for like the page's player does (with the page as referer).
 if (/pagewin-site\.net/.test(url)) { console.error('ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)'); process.exit(1); }
 if (/needsreferer/.test(url) && !get('--referer')) { console.error('ERROR: unable to download video data: HTTP Error 403: Forbidden'); process.exit(1); }
+// Sites that send a web page instead of the video.
+if (/htmlpage|htmlok|junksite\.example/.test(url)) {
+  if (process.env.FAKE_STATE_DIR) fs.appendFileSync(path.join(process.env.FAKE_STATE_DIR, 'html-runs.txt'), url + '\n');
+  const outp = get('-o').replace('.%(ext)s', '.mp4');
+  fs.mkdirSync(path.dirname(outp), { recursive: true });
+  fs.writeFileSync(outp + (/htmlpage/.test(url) ? '.part' : ''), '<!DOCTYPE html>\n<html><head><title>Some Channel - Videos</title></head><body>' + 'x'.repeat(70000) + '</body></html>');
+  if (/htmlok/.test(url)) { console.log(`STDONE|${outp}|NA|NA|NA|page|Generic`); process.exit(0); }
+  console.error('ERROR: Postprocessing: Error opening input files: Invalid data found when processing input');
+  process.exit(1);
+}
+if (/busy503/.test(url)) { console.error('ERROR: [generic] x: Unable to download webpage: HTTP Error 503: Service Temporarily Unavailable (caused by <HTTPError 503: Service Temporarily Unavailable>)'); process.exit(1); }
 if (/ratelimited/.test(url)) { console.error('ERROR: [generic] x: Unable to download webpage: HTTP Error 429: Too Many Requests'); process.exit(1); }
 if (/unknownsite/.test(url)) { console.error('ERROR: Unsupported URL: ' + url); process.exit(1); }
 if (/longpreview/.test(url)) {
   const outp = get('-o').replace('.%(ext)s', '.mp4');
   fs.mkdirSync(path.dirname(outp), { recursive: true });
-  fs.writeFileSync(outp, 'preview');
+  fs.writeFileSync(outp, Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.from('preview')]));
   console.log(`STDONE|${outp}|NA|NA|30|preview|Generic`);
   process.exit(0);
 }
@@ -113,6 +124,7 @@ const file = out.replace('.%(ext)s', '.' + fmt).replace(/%%/g, '%');
 for (let i = 1; i <= 4; i++) console.log(`STPROG|downloading|${i * 2500}|10000|NA|1000000|${4 - i}|NA|NA`);
 console.log('[Merger] Merging formats into "' + file + '"');
 fs.mkdirSync(path.dirname(file), { recursive: true });
-fs.writeFileSync(file, 'video-bytes-' + id);
+// Real files start like real MP4s (the app checks downloads really are video).
+fs.writeFileSync(file, Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.from('video-bytes-' + id)]));
 const dur = /v1/.test(id) ? 768 : /v3/.test(id) ? 930 : 61;
 console.log(`STDONE|${file}|1700000000|20231114|${dur}|${id}|Youtube`);

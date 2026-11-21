@@ -64,6 +64,7 @@ try { renameSaveFolder(dataDir, log); } catch (e) { log.warn('Save folder rename
 
 const settingsStore = new JsonStore(path.join(dataDir, 'settings.json'), settingsMod.defaults(app.getPath('videos')));
 const S = () => settingsStore.get();
+{ const up = settingsMod.upgrade(S()); if (up) settingsStore.set(up); }
 
 const engine = new Engine({ dir: path.join(dataDir, 'engine'), log });
 const library = new Library({ storeFile: path.join(dataDir, 'library.json'), probeDuration: (f) => engine.probeDuration(f), log });
@@ -231,6 +232,17 @@ queue.on('item', (v) => send('queue:item', v));
 queue.on('list', () => send('queue:list', queue.list()));
 queue.on('state', () => send('queue:state', { paused: queue.paused }));
 // A site's downloads are held until it gets a fresh pass: say so once.
+// A site kept sending web pages instead of videos: its downloads were paused. Say so once.
+queue.on('notVideos', ({ host, count, private: priv }) => {
+  const where = priv ? 'a site' : host;
+  send('queue:notVideos', { host: priv ? null : host, count });
+  showNotification('Downloads paused', `${where} is sending web pages instead of videos, so ${count} download${count === 1 ? ' was' : 's were'} paused. It may need you to be logged in. Check a video in your browser, then press Resume all to try again.`);
+});
+queue.on('onlyPreviews', ({ host, count, private: priv }) => {
+  const where = priv ? 'a site' : host;
+  send('queue:onlyPreviews', { host: priv ? null : host, count });
+  showNotification('Downloads paused', `${where} is only giving previews, not full videos, so ${count} download${count === 1 ? ' was' : 's were'} paused. It may need you to be logged in.`);
+});
 queue.on('needsPass', ({ host, count, private: priv }) => {
   const where = priv ? 'a site' : host;
   send('queue:needsPass', { host: priv ? null : host, count });
@@ -374,6 +386,8 @@ async function grabDirect(url, { quiet = false, useVisible = false } = {}) {
   }
   return {
     mediaUrl: g.media.url, referer: g.at || url, ua: g.ua, cookieFile: sites.writeDirectCookies(url, g.cookies), grab: g,
+    // Other addresses the player showed for the video: used too if they hold the very same file.
+    alternates: (g.media.alternates || []).map((c) => c.url).filter((u) => u && u !== g.media.url).slice(0, 3),
     // What the page says about the video: lets the queue fix up names and lengths before saving.
     info: { title: cleanPageTitle(g.title, hostOf(url) || ''), duration: Number.isFinite(g.duration) ? Math.round(g.duration) : null, thumbnail: g.thumbnail || null }
   };
@@ -485,7 +499,7 @@ async function checkVideoPage(url, { quiet } = {}) {
   const segs = (() => { try { return new URL(url).pathname.split('/').filter(Boolean); } catch { return []; } })();
   return { kind: 'video', url, id: segs[segs.length - 1] || url, extractor: 'Generic', site: host, title: cleanPageTitle(g.title, host),
     folder: cleanName(host || 'Other'), channelName: '', hasUploader: false, duration: Number.isFinite(g.duration) ? Math.round(g.duration) : null,
-    thumbnail: null, uploadDate: null, heights: g.media.height ? [g.media.height] : [], isLive: false, viaPage: true };
+    thumbnail: null, uploadDate: null, heights: g.media && g.media.height ? [g.media.height] : [], isLive: false, viaPage: true };
 }
 
 function logLookupFailure(e, opts) {

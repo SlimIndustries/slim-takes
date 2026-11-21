@@ -6,7 +6,8 @@
 
 const { BrowserWindow, session } = require('electron');
 const { crawl, resolveLinks } = require('./crawl');
-const { CF_CHECK, mediaProbe, AGE_CLICK, pickMedia, isVideoPage, explainNoMedia } = require('./scanlogic');
+const { mediaProbe, CF_CHECK } = require('./scanlogic');
+const { grabFlow } = require('./grabflow');
 const { Lanes } = require('./lanes');
 
 const PAGE_TIMEOUT = 30000;
@@ -222,7 +223,7 @@ function listen(ses) {
     if (!c) return;
     if (c.requests.length < 400) c.requests.push(d.url);
     const type = String(header(d.responseHeaders, 'content-type'));
-    if (MEDIA_TYPE.test(type) || MEDIA_URL.test(d.url)) c.media.set(d.url, { url: d.url, type, len: Number(header(d.responseHeaders, 'content-length')) || 0 });
+    if (MEDIA_TYPE.test(type) || MEDIA_URL.test(d.url)) c.media.set(d.url, { url: d.url, type, len: fileSize(d.statusCode, header(d.responseHeaders, 'content-range'), header(d.responseHeaders, 'content-length')) });
   });
 }
 
@@ -241,11 +242,22 @@ async function grabMedia(url, opts = {}) {
 }
 
 const MEDIA_TYPE = /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
-const MEDIA_URL = /\.(mp4|m4v|webm|mov|m3u8)(\?|$)/i;
+const MEDIA_URL = /\.(mp4|m4v|webm|mov|m3u8|mpd)(\?|$)/i;
+
+/**
+ * A file's full size from a response. Players ask for videos in chunks ("bytes 0-65535/123456789"):
+ * the chunk's own length is not the file's size. 0 = not known.
+ */
+function fileSize(status, contentRange, contentLength) {
+  const m = String(contentRange || '').match(/\/(\d+)\s*$/);
+  if (m) return Number(m[1]);
+  if (status === 206) return 0;
+  return Number(contentLength) || 0;
+}
 
 function siteError(message, props) { return Object.assign(new Error(message), props); }
 
-async function doGrab(url, { useVisible = false, log, timeoutMs = 20000, check = false } = {}) {
+async function doGrab(url, { useVisible = false, log, timeoutMs = 30000, check = false } = {}) {
   const ses = scanSession();
   listen(ses);
   let win = useVisible && visibleWin && !visibleWin.isDestroyed() ? visibleWin : null;
@@ -258,22 +270,24 @@ async function doGrab(url, { useVisible = false, log, timeoutMs = 20000, check =
   let status = 0;
   const onNav = (e, navUrl, code) => { status = code || status; };
   win.webContents.on('did-navigate', onNav);
-  try {
-    const alive = () => { if (win.isDestroyed()) throw new Error('The page window was closed.'); };
-    const js = (code) => { alive(); return win.webContents.executeJavaScript(code, true); };
-    const here = () => (win.isDestroyed() ? '' : win.webContents.getURL());
-    const open = async () => {
+  const alive = () => { if (win.isDestroyed()) throw new Error('The page window was closed.'); };
+  const checked = new Map(); // link -> first-bytes check (asked once per link)
+
+  // The page window, as the shared grab steps (grabflow.js) see it.
+  const driver = {
+    async open(u) {
+      alive();
       status = 0;
       let loadError = null;
-      try { await load(win, url); } catch (e) { loadError = e; }
-      if (status === 429) throw siteError('The site asked Slim Takes to slow down (too many requests).', { rateLimited: true });
-      if (status === 404 || status === 410) throw siteError('This video page doesn\'t exist any more.', { final: true });
-      if (loadError) throw loadError;
-    };
-    // Run the video finder in the page and in every frame inside it (many players live in a frame).
-    const probeAll = async (click) => {
+      try { await load(win, u); } catch (e) { loadError = e; }
+      if (!status && loadError) throw loadError;
+      return { status };
+    },
+    here: () => (win.isDestroyed() ? '' : win.webContents.getURL()),
+    js: async (code) => { alive(); return win.webContents.executeJavaScript(code, true); },
+    async probeAll() {
       alive();
-      const code = mediaProbe(click);
+      const code = mediaProbe(false);
       const top = await win.webContents.executeJavaScript(code, true).catch(() => null);
       const out = top ? [...top.out] : [];
       let duration = top && top.duration;
@@ -291,49 +305,77 @@ async function doGrab(url, { useVisible = false, log, timeoutMs = 20000, check =
       }
       const base = top || { title: '', thumb: null, at: url, ua: null, player: null };
       return { ...base, out, duration, framePlayer, loginWall };
-    };
-    if (!sameAddress(here(), url)) await open();
-    // Some checks clear themselves in a few seconds: wait a little before giving up.
-    const checkUntil = Date.now() + 8000;
-    while (await js(CF_CHECK).catch(() => false) && Date.now() < checkUntil) await settle(win, 2000);
-    if (await js(CF_CHECK).catch(() => false)) {
-      throw siteError('The site\'s "are you human" check came up. Use Open the page (or your normal browser) to get past it, then try again.', { siteCheck: true });
+    },
+    async clickAt(x, y) {
+      alive();
+      // A real mouse click (players that ignore clicks made by page scripts still react to this).
+      const wc = win.webContents;
+      wc.sendInputEvent({ type: 'mouseMove', x, y });
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      await wait(60);
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+    },
+    media: () => [...got.media.values()],
+    requests: () => got.requests,
+    async fetchStart(mediaUrl) {
+      if (checked.has(mediaUrl)) { const c = checked.get(mediaUrl); if (c.error) throw c.error; return c; }
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      try {
+        const res = await ses.fetch(mediaUrl, { signal: ctl.signal, referrer: url, headers: { Range: 'bytes=0-4095', 'User-Agent': win.isDestroyed() ? ses.getUserAgent() : win.webContents.getUserAgent() } });
+        if (res.status >= 400) throw new Error('the site answered ' + res.status);
+        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        const parts = [];
+        let size = 0;
+        while (reader && size < 4096) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value);
+          size += value.length;
+        }
+        if (reader) reader.cancel().catch(() => {});
+        const bytes = new Uint8Array(size);
+        let o = 0;
+        for (const part of parts) { bytes.set(part, o); o += part.length; }
+        // The file's full size: "bytes 0-4095/123456789", or the plain length if the site ignored the range.
+        const range = res.headers.get('content-range') || '';
+        const m = range.match(/\/(\d+)\s*$/);
+        const total = m ? Number(m[1]) : (res.status === 200 ? Number(res.headers.get('content-length')) || null : null);
+        const out = { bytes: bytes.slice(0, 4096), type: res.headers.get('content-type') || '', total };
+        checked.set(mediaUrl, out);
+        return out;
+      } catch (e) {
+        checked.set(mediaUrl, { error: e });
+        throw e;
+      } finally { clearTimeout(timer); ctl.abort(); }
+    },
+    settle: (ms) => settle(win, ms),
+    // Some players won't start in a hidden window: "show" it, but invisible, unclickable, off the taskbar.
+    async wakeUp() {
+      if (!own || win.isDestroyed()) return;
+      try {
+        win.setOpacity(0);
+        win.setIgnoreMouseEvents(true);
+        win.setSkipTaskbar(true);
+        win.setFocusable(false);
+        win.showInactive();
+        await wait(500);
+      } catch { /* ignore */ }
     }
-    // Click past an age popup if there is one; if that leaves the page, come straight back.
-    if (await js(AGE_CLICK).catch(() => null)) {
-      await settle(win, 2500);
-      if (!sameAddress(here(), url)) await open();
-    }
-    let found = null, info = null, click = true, wanderedOff = 0;
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      info = (await probeAll(click)) || info;
-      // Pressing play opened an ad page instead? Go back, and stop pressing play.
-      if (!sameAddress(here(), url)) {
-        wanderedOff++;
-        click = false;
-        if (log) log.info('Page window: pressing play went to another page, going back');
-        if (wanderedOff > 2) break;
-        await open();
-        continue;
-      }
-      found = pickMedia(info ? info.out : [], [...got.media.values()]);
-      if (found && (found.height || found.hls || Date.now() - started > 6000)) break;
-      // Nothing playing and a login wall or copy protection showing: no point waiting.
-      if (!found && Date.now() - started > 6000 && explainNoMedia(info, got.requests).final) break;
-      await wait(1500);
-    }
-    if (!found) throw explainNoMedia(info, got.requests);
-    info = info || {};
-    const videoPage = isVideoPage(info);
-    if (check) return { media: found, videoPage: isVideoPage(info), title: info.title, duration: info.duration };
+  };
+
+  try {
+    const r = await grabFlow(driver, url, { log: log ? (m) => log.info(m) : null, timeoutMs, check });
+    if (check) return { media: r.media, videoPage: r.videoPage, title: r.info && r.info.title, duration: r.info && r.info.duration };
+    const info = r.info || {};
+    const found = r.media;
     if (log) log.info(`Got the video from the page (${found.hls ? 'stream' : 'file'}${found.height ? ', ' + found.height + 'p' : ''})`);
-    const html = await js('document.documentElement.outerHTML').catch(() => '');
+    const html = await driver.js('document.documentElement.outerHTML').catch(() => '');
     // Cookies for the site and for wherever the video file lives.
-    const hosts = [hostOf(url), hostOf(found.url)].filter(Boolean);
+    const hosts = [hostOf(url), hostOf(found.url), ...(found.alternates || []).map((c) => hostOf(c.url))].filter(Boolean);
     const all = await ses.cookies.get({});
     const cookies = all.filter((c) => { const d = String(c.domain || '').replace(/^\./, '').replace(/^www\./, ''); return hosts.some((h) => d === h || h.endsWith('.' + d) || d.endsWith('.' + h)); });
-    return { media: found, videoPage, title: info.title, thumbnail: info.thumb, duration: info.duration, at: url, ua: info.ua || win.webContents.getUserAgent() || ses.getUserAgent(), html, cookies };
+    return { media: found, videoPage: r.videoPage, title: info.title, thumbnail: info.thumb, duration: info.duration, at: url, ua: info.ua || (win.isDestroyed() ? ses.getUserAgent() : win.webContents.getUserAgent()), html, cookies };
   } finally {
     collectors.delete(wcId);
     if (!win.isDestroyed()) win.webContents.removeListener('did-navigate', onNav);

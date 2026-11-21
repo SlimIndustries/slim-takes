@@ -191,6 +191,8 @@ function wireEvents() {
     refreshFree();
   });
   api.on('queue:diskLow', (free) => toast(`Downloads paused: only ${fmtBytes(free)} left on the drive.`, 8000));
+  api.on('queue:onlyPreviews', ({ host, count }) => toast(`${host || 'A site'} is only giving previews, not full videos, so ${count} download${count === 1 ? ' was' : 's were'} paused. It may need you to be logged in.`, 15000));
+  api.on('queue:notVideos', ({ host, count }) => toast(`${host || 'A site'} is sending web pages instead of videos, so ${count} download${count === 1 ? ' was' : 's were'} paused. It may need you to be logged in. Check a video in your browser, then press Resume all to try again.`, 15000));
   api.on('queue:needsPass', ({ host, count }) => toast(`${count} download${count === 1 ? '' : 's'} from ${host || 'a site'} ${count === 1 ? 'is' : 'are'} waiting for a fresh pass. Use "Open the page" in Channel grab (or your normal browser) and they'll carry on by themselves.`, 12000));
   api.on('watch:changed', (w) => { state.watch = w; if (state.view === 'watch') renderView(); });
   api.on('history:changed', () => { if (state.view === 'history') loadHistory(); });
@@ -607,6 +609,12 @@ function queueRow(it) {
   else if (it.status === 'paused') actions.push(iconBtn('play', 'Resume', () => api.queueAction('resume', it.id)), iconBtn('x', 'Remove', () => api.queueAction('remove', it.id)));
   else if (it.status === 'failed') {
     if (needsLogin(it.error)) actions.push(h('button', { type: 'button', class: 'btn', onclick: openAccounts }, 'Set up browser login'));
+    if (it.updateHint) actions.push(h('button', { type: 'button', class: 'btn', onclick: async (e) => {
+      e.target.disabled = true; e.target.textContent = 'Updating…';
+      const r = await api.updateEngine().catch((err) => ({ ok: false, message: cleanErr(err) }));
+      toast(r.ok ? (r.updated ? 'Engine updated. Press Retry.' : 'The engine is already up to date. The site may be offline, or it changed: try again later.') : 'Engine update failed: ' + r.message, 8000);
+      e.target.textContent = 'Update engine'; e.target.disabled = false;
+    } }, 'Update engine'));
     actions.push(h('button', { type: 'button', class: 'btn primary', onclick: () => api.queueAction('retry', it.id) }, 'Retry'), iconBtn('x', 'Remove', () => api.queueAction('remove', it.id)));
   }
   else if (it.status === 'canceled') actions.push(iconBtn('retry', 'Start again', () => api.queueAction('resume', it.id)), iconBtn('x', 'Remove', () => api.queueAction('remove', it.id)));
@@ -1122,6 +1130,8 @@ function viewSettings() {
         h('h2', { class: 'anton' }, 'DOWNLOADS'),
         h('div', { class: 'row', style: { flexWrap: 'nowrap' } },
           h('label', { class: 'field grow' }, 'At once', select([1, 2, 3, 4, 5, 6].map((n) => [String(n), String(n)]), String(s.concurrent), (v) => set({ concurrent: Number(v) }))),
+          h('label', { class: 'field grow', title: 'Sites often slow down each connection. More connections per video = faster downloads from those sites. If a site allows fewer, Slim Takes finds out and uses fewer for it.' }, 'Connections per video',
+            select([['1', '1 (off)'], ['2', '2'], ['4', '4'], ['6', '6'], ['8', '8'], ['16', '16 (max)']], String(s.connections || 8), (v) => set({ connections: Number(v) }))),
           h('label', { class: 'field grow' }, 'Speed limit', select([['0', 'None'], ['50', '50 MB/s'], ['20', '20 MB/s'], ['10', '10 MB/s'], ['5', '5 MB/s'], ['2', '2 MB/s'], ['1', '1 MB/s']], String(s.speedLimitMB), (v) => set({ speedLimitMB: Number(v) })))),
         chk('polite', 'Polite mode', '(short pauses so sites don\'t block big grabs)'),
         h('div', { class: 'row', style: { flexWrap: 'nowrap' } },

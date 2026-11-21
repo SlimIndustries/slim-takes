@@ -1,7 +1,7 @@
 {
   "name": "slim-takes",
   "productName": "Slim Takes",
-  "version": "1.2.5",
+  "version": "1.2.11",
   "description": "Download videos and audio from YouTube and 1,000+ sites. Free, no limits.",
   "main": "main.js",
   "author": "Slim Industries <slimindustries.apps@gmail.com>",
@@ -10,7 +10,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "dist": "electron-builder --win portable --x64",
     "dist:installer": "electron-builder --win nsis --x64"
   },

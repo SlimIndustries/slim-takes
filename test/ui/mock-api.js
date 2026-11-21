@@ -4,7 +4,7 @@
   const listeners = {};
   const now = Date.now();
   const settings = {
-    folder: 'C:\\Users\\Slim\\Videos\\SlimTakes', format: 'mp4', quality: '1080', concurrent: 3, speedLimitMB: 0, polite: true, retries: 2,
+    folder: 'C:\\Users\\Slim\\Videos\\SlimTakes', format: 'mp4', quality: '1080', concurrent: 3, connections: 8, speedLimitMB: 0, polite: true, retries: 2,
     minFreeGB: 10, whenDone: 'nothing', sponsorblock: true, subs: false, embed: true, setFileDate: true, cover: false, cookiesBrowser: 'none',
     notifyWindows: true, discordWebhook: '', blurThumbs: false, clearHistoryOnClose: false, tray: true, startWithWindows: false,
     watchInterval: '2h', theme: params.get('theme') || 'crimson', customAccent: '#33ccaa', clipboardWatch: true, checkAppUpdates: true,
@@ -37,7 +37,7 @@
   ];
   const engineReady = params.get('setup') !== '1';
   window.slim = {
-    init: async () => ({ locked: params.get('locked') === '1', version: '1.2.5', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
+    init: async () => ({ locked: params.get('locked') === '1', version: '1.2.11', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
     verifyPin: async () => false, setPin: async () => settings,
     setSettings: async (p) => Object.assign(settings, p),
     engineStatus: async () => ({ ready: true }), installEngine: () => new Promise(() => {

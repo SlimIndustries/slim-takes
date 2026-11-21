@@ -119,6 +119,13 @@ class Engine {
     return { ok: true, updated: !upToDate, message: upToDate ? 'Already up to date' : 'Updated' };
   }
 
+  /** Does a video file have sound? true / false, or null if it can't tell. */
+  async hasAudio(file) {
+    const r = await run(this.ffprobe, ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file], { timeout: 30000 }).catch(() => null);
+    if (!r || r.code !== 0) return null;
+    return r.stdout.trim().length > 0;
+  }
+
   async probeDuration(file) {
     const r = await run(this.ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { timeout: 30000 });
     const n = parseFloat(r.stdout);

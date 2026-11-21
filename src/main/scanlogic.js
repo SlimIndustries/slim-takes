@@ -420,20 +420,27 @@ function heightOf(text) {
  * Choose the video file to download from what the page offered.
  * candidates: [{ url, label, from }] from the page; network: [{ url, type, len }] the player asked for.
  */
-function pickMedia(candidates, network = []) {
+function rankMedia(candidates, network = []) {
   const all = [];
   for (const c of candidates || []) all.push({ url: c.url, label: c.label || '', from: c.from || 'page', len: 0 });
   for (const n of network || []) all.push({ url: n.url, label: '', from: 'net', len: n.len || 0, type: n.type || '' });
-  const seen = new Set();
-  const scored = [];
+  // The same link seen several ways (in the page's code AND asked for by the player): merge what's known.
+  const merged = new Map();
   for (const c of all) {
     let u;
     try { u = new URL(c.url); } catch { continue; }
     if (!/^https?:$/.test(u.protocol)) continue;
     const key = u.href.split('#')[0];
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const isHls = /\.m3u8(\?|$)/i.test(u.pathname + u.search) || /mpegurl/i.test(c.type || '');
+    const prev = merged.get(key);
+    if (!prev) { merged.set(key, { ...c, u }); continue; }
+    if (c.from === 'net') { prev.from = 'net'; prev.len = c.len || prev.len; prev.type = c.type || prev.type; }
+    if (!prev.label && c.label) prev.label = c.label;
+  }
+  const scored = [];
+  for (const c of merged.values()) {
+    const u = c.u;
+    // Streams: HLS (.m3u8) or DASH (.mpd) lists. They contain every quality; the engine picks the best.
+    const isHls = /\.(m3u8|mpd)(\?|$)/i.test(u.pathname + u.search) || /mpegurl|dash\+xml/i.test(c.type || '');
     const isFile = /\.(mp4|m4v|webm|mov)(\?|$)/i.test(u.pathname) || /^video\//i.test(c.type || '');
     if (!isHls && !isFile) continue;
     if (AD_RE.test(u.pathname) || AD_HOST_RE.test(u.hostname)) continue;
@@ -443,13 +450,76 @@ function pickMedia(candidates, network = []) {
     let score = height || (isHls ? 1500 : 600);
     if (isHls && /master|playlist|index/i.test(u.pathname)) score += 300;
     if (c.from === 'video' || c.from === 'source') score += 50;
-    if (c.from === 'net') score += 20;
+    if (c.from === 'net') score += 100; // the player really asked for this one (links only in the page's code can be decoys)
     // Unlabelled files: the bigger one is the video (ads and previews are short).
     if (!height && c.len) score += Math.min(300, Math.floor(c.len / 5e6));
-    scored.push({ url: u.href, height, hls: isHls, score });
+    scored.push({ url: u.href, height, hls: isHls, score, from: c.from });
   }
   scored.sort((a, b) => b.score - a.score);
-  return scored[0] || null;
+  return scored;
+}
+
+/** The best-looking video file from what the page offered (see rankMedia). */
+function pickMedia(candidates, network = []) { return rankMedia(candidates, network)[0] || null; }
+
+// ---------- is it really a video? ----------
+
+/**
+ * What the first bytes of a download are: 'video', 'playlist' (a stream's list of pieces),
+ * 'html' (a web page: sites send one instead of the video when a link is fake, expired or refused),
+ * 'text' (some other text, not a video) or 'unknown' (binary we don't recognise: give it the benefit of the doubt).
+ */
+function sniffMedia(bytes, contentType = '') {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const type = String(contentType || '').toLowerCase();
+  if (!b.length) return /^video\/|mpegurl|dash\+xml/.test(type) ? 'video' : 'unknown';
+  const ascii = (from, n) => String.fromCharCode(...b.slice(from, from + n));
+  // Containers: MP4/MOV (ftyp/moov/mdat/free/wide at byte 4), WebM/MKV, MPEG-TS, FLV, AVI, Ogg, MP3/ADTS audio.
+  if (b.length >= 8 && /^(ftyp|moov|mdat|free|wide|skip|styp)$/.test(ascii(4, 4))) return 'video';
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return 'video';
+  if (b[0] === 0x47 && (b.length < 189 || b[188] === 0x47)) return 'video';
+  if (ascii(0, 3) === 'FLV' || ascii(0, 4) === 'RIFF' || ascii(0, 4) === 'OggS' || ascii(0, 3) === 'ID3' || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0)) return 'video';
+  // Text: skip a byte-order mark and leading spaces.
+  let i = 0;
+  if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) i = 3;
+  while (i < b.length && (b[i] === 0x20 || b[i] === 0x09 || b[i] === 0x0a || b[i] === 0x0d)) i++;
+  const head = ascii(i, Math.min(200, b.length - i)).toLowerCase();
+  if (head.startsWith('#extm3u')) return 'playlist';
+  if (head.startsWith('<?xml') && /<mpd/i.test(ascii(i, Math.min(2000, b.length - i)))) return 'playlist';
+  if (head.startsWith('<mpd')) return 'playlist';
+  if (head.startsWith('<!doctype html') || head.startsWith('<html') || head.startsWith('<head') || head.startsWith('<!--') || /^<(body|div|script|meta|title)\b/.test(head) || /text\/html/.test(type)) return 'html';
+  const sample = b.slice(i, i + 512);
+  const printable = sample.filter((c) => c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127)).length;
+  if (sample.length && printable / sample.length > 0.95) return 'text';
+  return 'unknown';
+}
+
+/**
+ * Try the ranked video links in order and return the first one that really is a video (or a stream's
+ * list), checking only its first few bytes. fetchStart(url) => { bytes, type, finalUrl }.
+ * Decoy links in a page's code (that lead back to a web page) are skipped.
+ */
+async function firstRealMedia(ranked, fetchStart, { max = 6, log, minBytes = 0 } = {}) {
+  const list = (ranked || []).slice(0, max);
+  let refused = 0;
+  for (const c of list) {
+    let r;
+    try { r = await fetchStart(c.url); } catch (e) { if (log) log(`couldn't check a video link (${e.message})`); continue; }
+    const kind = sniffMedia(r.bytes, r.type);
+    // A file far too small for the video's length is a preview or a trailer, not the video.
+    if (kind !== 'playlist' && minBytes && r.total && r.total < minBytes) {
+      if (log) log(`skipped a video link: only ${Math.round(r.total / 1e6 * 10) / 10} MB, too small for the video (a preview)`);
+      refused++;
+      continue;
+    }
+    if (kind === 'video' || kind === 'playlist' || kind === 'unknown') return { ...c, checked: kind, total: r.total || null };
+    if (log) log(`skipped a video link: it leads to ${kind === 'html' ? 'a web page' : 'something that isn\'t a video'}`);
+    refused++;
+  }
+  // None could even be checked (the check itself failed): don't throw good links away over that;
+  // the downloaded file is checked again before it's kept.
+  if (list.length && refused === 0) return { ...list[0], checked: 'unchecked' };
+  return { none: true };
 }
 
 /**
@@ -498,4 +568,4 @@ function cleanPageTitle(title, host) {
   return parts.join(' - ').trim() || t;
 }
 
-module.exports = { hasVideoId, siteKey, CF_CHECK, MEDIA_PROBE, mediaProbe, pickMedia, isVideoPage, explainNoMedia, looksLikeCode, cleanPageTitle, heightOf, uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };
+module.exports = { sniffMedia, firstRealMedia, rankMedia, hasVideoId, siteKey, CF_CHECK, MEDIA_PROBE, mediaProbe, pickMedia, isVideoPage, explainNoMedia, looksLikeCode, cleanPageTitle, heightOf, uploaderFromHtml, nameFromUrl, pickVideoLinks, candidateGroups, nameKey, keepCreatorTiles, shapeOf, titleFromPath, summarise, isMenuLink, COLLECT, AGE_CLICK, CLICK_NEXT };

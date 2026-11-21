@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { cookieHeader } = require('./fastget');
 
 const CLOUDFLARE = /cloudflare|anti-bot challenge|generic:impersonate|cf-mitigated|just a moment/i;
 const NO_IMPERSONATE = /impersonate target .* (is )?not available|no impersonate target|impersonation is not supported/i;
@@ -161,6 +162,30 @@ class Sites {
     fs.writeFileSync(file, toCookieFile(cookies), { mode: 0o600 });
     this.update(host, { direct: file });
     return file;
+  }
+
+  /** Request headers for downloading a video file found on a page ourselves (same as the engine would send). */
+  directHeaders(direct, url) {
+    const h = {};
+    if (!direct) return h;
+    if (direct.referer) h.Referer = direct.referer;
+    if (direct.ua) h['User-Agent'] = direct.ua;
+    if (direct.cookieFile && direct.cookieFile.startsWith(this.dir) && fs.existsSync(direct.cookieFile)) {
+      const c = cookieHeader(fs.readFileSync(direct.cookieFile, 'utf8'), url || direct.mediaUrl);
+      if (c) h.Cookie = c;
+    }
+    return h;
+  }
+
+  /** How many connections a video server accepted at once last time (forgotten after a week, so it gets re-tested). */
+  fastLimit(server) {
+    const e = this.get(String(server || '').toLowerCase());
+    return e && e.fastLimit && Date.now() - (e.fastLimitAt || 0) < 7 * 24 * 3600 * 1000 ? e.fastLimit : null;
+  }
+
+  setFastLimit(server, n) {
+    if (!server || !(n >= 1)) return;
+    this.update(String(server).toLowerCase(), { fastLimit: n, fastLimitAt: Date.now() });
   }
 
   /** Engine options for downloading a video file found on a page (sent like the page window would). */

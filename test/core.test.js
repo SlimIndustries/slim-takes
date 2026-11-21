@@ -581,3 +581,51 @@ test('page scan: video links without numbers, other parts of the same site, sing
   const noise = candidateGroups([{ href: 'https://example.com/lawns' }, { href: 'https://example.com/news/today' }], 'https://example.com/star/jimmy');
   assert.equal(noise.length, 0, 'plain words are still not videos');
 });
+
+test('is it really a video? first-bytes check', () => {
+  const { sniffMedia } = require('../src/main/scanlogic');
+  const b = (arr) => Uint8Array.from(arr);
+  const str = (t) => new TextEncoder().encode(t);
+  assert.equal(sniffMedia(b([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])), 'video', 'MP4');
+  assert.equal(sniffMedia(b([0x1a, 0x45, 0xdf, 0xa3, 1, 2])), 'video', 'WebM/MKV');
+  const ts = new Uint8Array(400); ts[0] = 0x47; ts[188] = 0x47;
+  assert.equal(sniffMedia(ts), 'video', 'MPEG-TS');
+  assert.equal(sniffMedia(str('#EXTM3U\n#EXT-X-VERSION:3')), 'playlist');
+  assert.equal(sniffMedia(str('<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash">')), 'playlist');
+  assert.equal(sniffMedia(str('\n  <!DOCTYPE html><html><head><title>Some Channel - Videos</title>')), 'html', 'web page');
+  assert.equal(sniffMedia(str('﻿<html lang="en">')), 'html');
+  assert.equal(sniffMedia(str('{"error":"forbidden"}')), 'text');
+  assert.equal(sniffMedia(b([0x01, 0x02, 0x03, 0x99, 0xaa])), 'unknown');
+  assert.equal(sniffMedia(new Uint8Array(0), 'video/mp4'), 'video');
+});
+
+test('decoy video links are skipped by checking their first bytes (real web server)', async () => {
+  const http = require('http');
+  const { firstRealMedia } = require('../src/main/scanlogic');
+  const html = '<!DOCTYPE html><html><head><title>Some Channel - Videos</title></head><body>page</body></html>';
+  const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(9000, 1)]);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/fake_1080p.mp4') { res.writeHead(302, { Location: '/channel/x/' }); return res.end(); }
+    if (req.url === '/channel/x/') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(html); }
+    if (req.url === '/real_720p.mp4') { res.writeHead(206, { 'Content-Type': 'video/mp4' }); return res.end(mp4.subarray(0, 4096)); }
+    if (req.url === '/gone.mp4') { res.writeHead(404); return res.end('nope'); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => server.listen(0, r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const fetchStart = async (u) => {
+    const r = await fetch(u, { headers: { Range: 'bytes=0-4095' } });
+    if (r.status >= 400) throw new Error('the site answered ' + r.status);
+    return { bytes: new Uint8Array(await r.arrayBuffer()).slice(0, 4096), type: r.headers.get('content-type') || '' };
+  };
+  try {
+    const picked = await firstRealMedia([{ url: base + '/fake_1080p.mp4', height: 1080 }, { url: base + '/gone.mp4' }, { url: base + '/real_720p.mp4', height: 720 }], fetchStart);
+    assert.equal(picked.url, base + '/real_720p.mp4', 'decoy (leads to the channel page) and dead link skipped');
+    assert.equal(picked.checked, 'video');
+    const none = await firstRealMedia([{ url: base + '/fake_1080p.mp4' }], fetchStart);
+    assert.ok(none.none, 'only decoys: nothing picked');
+    // the check itself not working at all must not throw good links away
+    const unchecked = await firstRealMedia([{ url: base + '/real_720p.mp4' }], async () => { throw new Error('offline'); });
+    assert.equal(unchecked.checked, 'unchecked');
+  } finally { server.close(); }
+});

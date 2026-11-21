@@ -10,6 +10,7 @@ function defaults(videosDir) {
     format: 'mp4',
     quality: '1080',
     concurrent: 3,
+    connections: 8,          // most connections per video file (sites often slow each one down); 1 = off
     speedLimitMB: 0,
     polite: true,
     retries: 2,
@@ -48,6 +49,7 @@ const RULES = {
   format: (v) => ['mp4', 'mkv', 'mov', 'webm', 'avi', 'mp3', 'm4a', 'flac', 'wav', 'opus'].includes(v),
   quality: (v) => ['best', '2160', '1440', '1080', '720', '480', '360'].includes(v),
   concurrent: (v) => Number.isInteger(v) && v >= 1 && v <= 8,
+  connections: (v) => Number.isInteger(v) && v >= 1 && v <= 16,
   speedLimitMB: (v) => typeof v === 'number' && v >= 0 && v <= 1000,
   polite: (v) => typeof v === 'boolean',
   retries: (v) => Number.isInteger(v) && v >= 0 && v <= 5,
@@ -89,4 +91,11 @@ function publicSettings(s) {
   return { ...rest, hasPin: !!pinHash };
 }
 
-module.exports = { defaults, applyPatch, publicSettings, UPDATE_REPO };
+/** Settings saved by an older version that need a change. Returns the new settings, or null if none. */
+function upgrade(s) {
+  if (!s || s.connectionsV2) return null;
+  // 4 was the old default: anyone still on it gets the new one (the downloader now finds each site's limit itself).
+  return { ...s, connections: s.connections === 4 || s.connections == null ? 8 : s.connections, connectionsV2: true };
+}
+
+module.exports = { defaults, applyPatch, publicSettings, upgrade, UPDATE_REPO };
