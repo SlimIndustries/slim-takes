@@ -1,4 +1,5 @@
 'use strict';
+const { tmpdir } = require('./helpers/tmp');
 // Stress tests for the multi-connection downloader, against a local server that slows down every
 // single connection (like the sites that crawl at ~500 KB/s).
 const test = require('node:test');
@@ -9,7 +10,7 @@ const path = require('path');
 const { fastGet, cookieHeader, isStreamUrl } = require('../src/main/fastget');
 
 const { serve, videoBytes, sha, MB } = require('./helpers/server');
-const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fg-')), 'out.mp4');
+const tmpFile = () => path.join(tmpdir('fg-'), 'out.mp4');
 
 test('throttled site: 4 connections are much faster than 1, and the file is byte-for-byte right', async () => {
   const file = videoBytes(24 * MB);

@@ -869,14 +869,47 @@ test('mixed queue: a decoy site switching over doesn\'t touch other sites (they 
 test('paused videos from before get the page window when resumed', async () => {
   const s = setup({ concurrent: 2 });
   const { calls } = junkSite(s);
-  // what the reported run left behind: videos held after web pages came back
-  for (let i = 0; i < 5; i++) s.queue.add({ url: `https://junksite.example/video/old${i}`, title: 'Old ' + i, folder: 'O', extractor: 'Generic' });
+  // what the reported run left behind: videos held after web pages came back (nothing running)
   s.queue.pauseAll();
+  for (let i = 0; i < 5; i++) s.queue.add({ url: `https://junksite.example/video/old${i}`, title: 'Old ' + i, folder: 'O', extractor: 'Generic' });
   for (const it of s.queue.items) { it.status = 'paused'; it.heldForPass = true; it.note = 'Paused: this site is sending web pages instead of videos'; }
   s.queue.resumeAll();
   const list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'failed', 'paused'].includes(x.status)), 30000);
-  assert.ok(list.every((x) => x.status === 'done'));
+  assert.ok(list.every((x) => x.status === 'done'), JSON.stringify(list.map((x) => [x.title, x.status, x.note, x.error])));
   assert.ok(calls.length >= 4);
+  assert.equal(htmlRuns(s).length, 0, 'none went to the engine first (that\'s what got them held)');
+});
+
+test('Pause while videos are just starting: they don\'t start; Resume carries them on; Pause+Resume at once never leaves one stuck', async () => {
+  const s = setup({ concurrent: 3 });
+  // Starting takes a moment (claiming the file name): pause right in that moment.
+  const claim = s.queue.library.claim.bind(s.queue.library);
+  s.queue.library.claim = async (x) => { await new Promise((r) => setTimeout(r, 150)); return claim(x); };
+  for (let i = 0; i < 3; i++) s.queue.add({ url: `https://www.youtube.com/watch?v=ps${i}`, title: 'Starting ' + i, folder: 'PS' });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(s.queue.items.every((x) => x.status === 'starting'));
+  s.queue.pauseAll();
+  let list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'paused'));
+  await new Promise((r) => setTimeout(r, 400));
+  assert.ok(s.queue.list().every((x) => x.status === 'paused'), 'still paused, nothing downloaded');
+  assert.equal(s.queue.procs.size, 0, 'no download running');
+  s.queue.resumeAll();
+  list = await waitFor(s.queue, (l) => l.every((x) => x.status === 'done'));
+  // Pause and Resume straight away, while starting: carries on.
+  for (let i = 3; i < 6; i++) s.queue.add({ url: `https://www.youtube.com/watch?v=ps${i}`, title: 'Starting ' + i, folder: 'PS' });
+  await new Promise((r) => setTimeout(r, 30));
+  s.queue.pauseAll();
+  s.queue.resumeAll();
+  list = await waitFor(s.queue, (l) => l.every((x) => ['done', 'paused', 'failed'].includes(x.status)));
+  assert.ok(list.every((x) => x.status === 'done'), JSON.stringify(list.map((x) => [x.title, x.status])));
+  // And one video at a time: Pause and Resume on a starting one.
+  s.queue.add({ url: 'https://www.youtube.com/watch?v=ps9', title: 'Starting 9', folder: 'PS' });
+  await new Promise((r) => setTimeout(r, 30));
+  const id = s.queue.items.find((x) => x.title === 'Starting 9').id;
+  s.queue.pause(id);
+  s.queue.resume(id);
+  list = await waitFor(s.queue, (l) => ['done', 'paused'].includes(l.find((x) => x.title === 'Starting 9').status));
+  assert.equal(list.find((x) => x.title === 'Starting 9').status, 'done');
 });
 
 

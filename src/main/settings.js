@@ -10,6 +10,9 @@ function defaults(videosDir) {
     format: 'mp4',
     quality: '1080',
     concurrent: 3,
+    convertFormat: 'mp3',     // Convert & Trim: last format picked
+    convertQuality: 'high',
+    convertOutDir: '',        // '' = next to the original
     connections: 8,          // most connections per video file (sites often slow each one down); 1 = off
     speedLimitMB: 0,
     polite: true,
@@ -33,7 +36,6 @@ function defaults(videosDir) {
     watchInterval: '2h',
     theme: 'crimson',
     customAccent: '#ff3b3b',
-    clipboardWatch: true,
     checkAppUpdates: true,
     autoUpdateEngine: true,
     lastEngineUpdate: 0,
@@ -50,6 +52,9 @@ const RULES = {
   quality: (v) => ['best', '2160', '1440', '1080', '720', '480', '360'].includes(v),
   concurrent: (v) => Number.isInteger(v) && v >= 1 && v <= 8,
   connections: (v) => Number.isInteger(v) && v >= 1 && v <= 16,
+  convertFormat: (v) => ['mp4', 'mkv', 'mov', 'webm', 'mp3', 'm4a', 'flac', 'wav', 'opus'].includes(v),
+  convertQuality: (v) => ['high', 'medium', 'small'].includes(v),
+  convertOutDir: (v) => typeof v === 'string' && v.length < 1000,
   speedLimitMB: (v) => typeof v === 'number' && v >= 0 && v <= 1000,
   polite: (v) => typeof v === 'boolean',
   retries: (v) => Number.isInteger(v) && v >= 0 && v <= 5,
@@ -70,7 +75,6 @@ const RULES = {
   watchInterval: (v) => ['1h', '2h', '6h', '12h', '24h', 'manual'].includes(v),
   theme: (v) => ['crimson', 'ice', 'toxic', 'amber', 'violet', 'daylight', 'custom'].includes(v),
   customAccent: (v) => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v),
-  clipboardWatch: (v) => typeof v === 'boolean',
   checkAppUpdates: (v) => typeof v === 'boolean',
   autoUpdateEngine: (v) => typeof v === 'boolean',
   autoClearDays: (v) => [0, 1, 7, 30].includes(v)

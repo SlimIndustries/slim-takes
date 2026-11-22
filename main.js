@@ -1,7 +1,7 @@
 'use strict';
 // Slim Takes — main process.
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, Notification, clipboard, protocol, nativeImage, powerSaveBlocker, screen, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, Notification, protocol, nativeImage, powerSaveBlocker, screen, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -18,6 +18,9 @@ const { extractLinks, looksLikeVideo } = require('./src/main/urls');
 const { estimateBytes } = require('./src/main/formats');
 const settingsMod = require('./src/main/settings');
 const { serveFile } = require('./src/main/range');
+const { contextMenuTemplate } = require('./src/main/contextmenu');
+const { Converter, isMediaName } = require('./src/main/convert');
+const { startMediaServer } = require('./src/main/mediaserver');
 const { FolderSync } = require('./src/main/sync');
 const { pageScan, openVisible, scanVisible, closeVisible, clearScanData, followLinks, fetchPage, siteCookies, usePass, isScanningVisible, freshWindowPass, grabMedia } = require('./src/main/pagescan');
 const { BROWSERS, LABEL: BROWSER_LABEL, browserIdentity, exportBrowserCookies, readCookieFile } = require('./src/main/browserpass');
@@ -71,6 +74,12 @@ const library = new Library({ storeFile: path.join(dataDir, 'library.json'), pro
 const sites = new Sites({ store: new JsonStore(path.join(dataDir, 'sites.json'), {}), dir: path.join(dataDir, 'sites'), log });
 const prober = new Prober({ engine, log, sites });
 const history = new History(new JsonStore(path.join(dataDir, 'history.json'), []));
+// Convert & Trim: files the user picks or drops, converted one at a time.
+const converter = new Converter({ engine, log, previewDir: path.join(dataDir, 'previews') });
+converter.on('job', (j) => send('convert:job', j));
+// The Trim player gets its files from a private local server (see mediaserver.js for why).
+let mediaServer = null;
+const mediaServerReady = () => (mediaServer = mediaServer || startMediaServer({ allowed: (p) => converter.allowed(p) }).catch((e) => { log.warn('Trim player server: ' + e.message); mediaServer = null; return null; }));
 const queue = new Queue({
   engine, library, getSettings: S, log, history,
   store: new JsonStore(path.join(dataDir, 'queue.json'), []),
@@ -118,6 +127,11 @@ function createWindow() {
     }
   });
   win.setMenuBarVisibility(false);
+  // Right-click: Cut / Copy / Paste / Select all in text boxes.
+  win.webContents.on('context-menu', (_e, params) => {
+    const t = contextMenuTemplate(params);
+    if (t.length) Menu.buildFromTemplate(t).popup({ window: win });
+  });
   win.loadFile(path.join(__dirname, 'src', 'renderer', 'index.html'));
   win.once('ready-to-show', () => {
     if (S().windowBounds && S().windowBounds.maximized) win.maximize();
@@ -721,6 +735,35 @@ handle('dialog:folder', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Choose where Slim Takes saves videos', properties: ['openDirectory', 'createDirectory'], defaultPath: S().folder });
   return r.canceled ? null : r.filePaths[0];
 });
+// ---------- Convert & Trim ----------
+const MEDIA_EXTS = ['mp4', 'm4v', 'mkv', 'mov', 'webm', 'avi', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'm2ts', 'mts', '3gp', 'ogv', 'mp3', 'm4a', 'aac', 'wav', 'flac', 'opus', 'ogg', 'oga', 'wma', 'aif', 'aiff', 'mka', 'amr', 'ac3'];
+handle('convert:pick', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose video or audio files', properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Video and audio', extensions: MEDIA_EXTS }, { name: 'All files', extensions: ['*'] }]
+  });
+  if (r.canceled) return null;
+  return converter.addFiles(r.filePaths);
+});
+// Files dropped on the window (their paths come from the window; each is checked by reading it).
+handle('convert:addPaths', (paths) => converter.addFiles(Array.isArray(paths) ? paths.filter((p) => typeof p === 'string') : []));
+handle('convert:start', (specs) => converter.start(Array.isArray(specs) ? specs : []));
+handle('convert:cancel', (id) => converter.cancel(String(id)));
+handle('convert:clear', () => converter.clearFinished());
+handle('convert:list', () => converter.list());
+handle('convert:waveform', (p) => converter.waveform(p));
+handle('convert:preview', (p) => converter.preview(p, { onProgress: (pct) => send('convert:previewProgress', { path: p, pct }) }));
+handle('convert:show', (p) => { if (converter.allowed(p)) shell.showItemInFolder(p); });
+handle('convert:mediaUrl', async (p, n) => {
+  if (!converter.allowed(p)) return null;
+  const s = await mediaServerReady();
+  return s ? s.url(p, Number(n) || 0) : null;
+});
+handle('convert:chooseFolder', async () => {
+  const r = await dialog.showOpenDialog(win, { title: 'Choose where converted files go', properties: ['openDirectory', 'createDirectory'], defaultPath: S().convertOutDir || S().folder });
+  return r.canceled ? null : r.filePaths[0];
+});
+handle('convert:isMedia', (names) => (Array.isArray(names) ? names.map((n) => isMediaName(n)) : []));
 handle('dialog:importLinks', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Import links', properties: ['openFile'], filters: [{ name: 'Text files', extensions: ['txt', 'csv', 'md'] }] });
   if (r.canceled) return null;
@@ -771,26 +814,10 @@ function freeSpace() {
 function registerFileProtocol() {
   protocol.handle('slimfile', (request) => {
     const p = decodeURIComponent(request.url.slice('slimfile://'.length).replace(/^\/+/, ''));
-    if (!allowedFile(p)) return new Response('Not allowed', { status: 403 });
+    if (!allowedFile(p) && !converter.allowed(p)) return new Response('Not allowed', { status: 403 });
     try { return serveFile(p, request.headers.get('range')); }
     catch (e) { return new Response('Could not read file', { status: 500 }); }
   });
-}
-
-// ---------- clipboard: offer to add copied links ----------
-let lastClip = '';
-function startClipboardWatch() {
-  // Ignore whatever was already copied before Slim Takes started.
-  try { lastClip = clipboard.readText(); } catch { /* ignore */ }
-  setInterval(() => {
-    if (!S().clipboardWatch || !unlocked) return;
-    let text = '';
-    try { text = clipboard.readText(); } catch { return; }
-    if (!text || text === lastClip) return;
-    lastClip = text;
-    const links = extractLinks(text);
-    if (links.length && links.length <= 50) send('clipboard:links', links);
-  }, 1500);
 }
 
 // ---------- updates ----------
@@ -837,7 +864,6 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   applyLoginItem();
-  startClipboardWatch();
   watch.startTimer();
   folderSync.run();
   folderSync.start();
@@ -856,6 +882,8 @@ app.on('before-quit', (e) => {
   if (cleanedUp) return;
   e.preventDefault();
   queue.stopAllForQuit();
+  converter.stopAll();
+  if (mediaServer) mediaServer.then((s) => s && s.close()).catch(() => {});
   folderSync.stop();
   if (S().clearHistoryOnClose) { history.clear(); library.clearIds(); log.clear(); }
   settingsStore.saveNow();

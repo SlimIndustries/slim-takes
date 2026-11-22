@@ -23,6 +23,7 @@ const STALL_MS = 20000;              // no data for this long: ask for the piece
 const RAMP_EVERY = 40;               // after this many good pieces in a row, try one more connection
 const MAX_CONNECTIONS = 16;
 const REFRESHES = 3;
+const TRANSIENT = new Set([500, 502, 504, 408, 520, 521, 522, 523, 524]);
 
 class FastGetError extends Error {
   constructor(message, props = {}) { super(message); Object.assign(this, props); }
@@ -358,6 +359,8 @@ async function fastGetPieces(url, file, opts) {
       try {
         arm();
         const res = await get(src.url, `bytes=${from}-${to}`, ctl);
+        // Server hiccups ("error", "bad gateway", "timeout"): ask for the piece again, they're not a "no".
+        if (TRANSIENT.has(res.status)) { await drain(res); return { transient: 'HTTP ' + res.status }; }
         if (res.status !== 206) { const accepted = src.pool.accepted; await drain(res); return { refused: res.status, retryAfter: retryAfterMs(res), accepted }; }
         const cr = (res.headers.get('content-range') || '').match(/bytes\s+(\d+)-(\d+)\/(\d+)/i);
         if (!cr || Number(cr[1]) !== from || Number(cr[3]) !== total) { await drain(res); return { refused: 'wrong part' }; }
@@ -406,7 +409,7 @@ async function fastGetPieces(url, file, opts) {
         let r;
         try { r = await fetchPiece(src, i); } finally { active--; release(src.pool); }
         if (r.ok) {
-          done.add(i); src.refusedInARow = 0; src.alone = 0; src.busySince = 0;
+          done.add(i); src.refusedInARow = 0; src.alone = 0; src.busySince = 0; src.netFails = 0; // hiccups only count in a row
           worked(src.pool, cap, opts.rampEvery);
           keepState();
           continue;

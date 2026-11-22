@@ -7,7 +7,7 @@
     folder: 'C:\\Users\\Slim\\Videos\\SlimTakes', format: 'mp4', quality: '1080', concurrent: 3, connections: 8, speedLimitMB: 0, polite: true, retries: 2,
     minFreeGB: 10, whenDone: 'nothing', sponsorblock: true, subs: false, embed: true, setFileDate: true, cover: false, cookiesBrowser: 'none',
     notifyWindows: true, discordWebhook: '', blurThumbs: false, clearHistoryOnClose: false, tray: true, startWithWindows: false,
-    watchInterval: '2h', theme: params.get('theme') || 'crimson', customAccent: '#33ccaa', clipboardWatch: true, checkAppUpdates: true,
+    watchInterval: '2h', theme: params.get('theme') || 'crimson', customAccent: '#33ccaa', checkAppUpdates: true,
     autoUpdateEngine: true, hasPin: params.get('locked') === '1'
   };
   const queue = [
@@ -37,7 +37,7 @@
   ];
   const engineReady = params.get('setup') !== '1';
   window.slim = {
-    init: async () => ({ locked: params.get('locked') === '1', version: '1.2.11', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
+    init: async () => ({ locked: params.get('locked') === '1', version: '1.3.4', settings, engine: { ytdlp: engineReady, ffmpeg: engineReady, deno: engineReady, ready: engineReady }, queue, paused: false, watch, freeBytes: 412e9 }),
     verifyPin: async () => false, setPin: async () => settings,
     setSettings: async (p) => Object.assign(settings, p),
     engineStatus: async () => ({ ready: true }), installEngine: () => new Promise(() => {
@@ -50,9 +50,32 @@
     queueAdd: async () => [], queueAction: async () => true, pauseAll: async () => {}, resumeAll: async () => {}, clearFinished: async () => {}, cancelAll: async () => 4, queueList: async () => queue,
     history: async () => history, historyRemove: async () => {}, historyClear: async () => {},
     watchGet: async () => watch, watchAdd: async () => 'x', watchAddUrl: async () => 'x', watchRemove: async () => {}, watchUpdate: async () => {}, watchCheckNow: async () => 0,
-    chooseFolder: async () => null, importLinks: async () => null, openFile: async () => '', showFile: async () => {}, fileExists: async () => true, openFolder: async () => '', openExternal: async () => {}, pathForFile: () => null,
+    chooseFolder: async () => null, importLinks: async () => null, openFile: async () => '', showFile: async () => {}, fileExists: async () => true, openFolder: async () => '', openExternal: async () => {}, pathForFile: (f) => (f && f.name ? '/drop/' + f.name : null),
     log: async () => '[2026-11-20 05:00:00] INFO Slim Takes 1.0.0 starting', openLogFolder: async () => {}, power: async () => true, checkUpdate: async () => ({}), diskFree: async () => 412e9,
     pageScanUseBrowser: async (u, b) => { if (b === 'chrome') throw new Error("Error invoking remote method 'pageScan:useBrowser': Error: Chrome locks its cookies so other apps can't read them (Chrome, Edge and Brave do this now). Firefox works best for this: pick Firefox, tick the box there, then press Done."); return { ok: true, browser: 'Firefox' }; },
+    // Convert & Trim (the check sets window._cv to control what happens).
+    convertPick: async () => (window._cv && window._cv.pick) || null,
+    convertAddPaths: async (paths) => { (window._cv.added ||= []).push(...paths); return paths.map((p) => (window._cv.byPath && window._cv.byPath[p]) || { ok: false, path: p, name: p.split('/').pop(), error: 'Slim Takes can\'t read this file.' }); },
+    convertStart: async (specs) => {
+      const cvs = window._cv; (cvs.started ||= []).push(...specs);
+      return specs.map((sp) => {
+        if (sp.format === 'mp4' && /wav$/.test(sp.path)) return { ok: false, error: 'This file has no picture. Pick an audio format (like MP3) instead.' };
+        const id = 'c' + ((cvs.seq = (cvs.seq || 0) + 1));
+        const name = sp.path.split('/').pop();
+        const base = { id, path: sp.path, name, format: sp.format, trim: sp.trim, mode: 'encode', out: null, error: null, eta: null };
+        const emit = (x) => (listeners['convert:job'] || []).forEach((f) => f({ ...base, ...x }));
+        setTimeout(() => emit({ status: 'waiting', pct: 0 }), 10);
+        setTimeout(() => emit({ status: 'converting', pct: 40, eta: 12 }), cvs.slow ? 300 : 60);
+        if (!cvs.hold) setTimeout(() => emit({ status: 'done', pct: 100, out: sp.path.replace(/\.[^.]+$/, '') + '.' + sp.format }), cvs.slow ? 2500 : 160);
+        return { ok: true, id };
+      });
+    },
+    convertCancel: async (id) => { (window._cv.canceled ||= []).push(id); (listeners['convert:job'] || []).forEach((f) => f({ id, status: 'canceled', pct: 0, path: '', name: '', format: 'mp3' })); return true; },
+    convertClear: async () => [], convertList: async () => [], convertShow: async (p) => { window._cv.shown = p; },
+    convertWaveform: async () => Array.from({ length: 800 }, (_, i) => (i > 380 && i < 420 ? 0.02 : 0.3 + 0.6 * Math.abs(Math.sin(i / 9)))),
+    convertPreview: async (p) => { window._cv.previewed = p; await new Promise((r) => setTimeout(r, 200)); return window._cv.previewPath; },
+    convertMediaUrl: async (p, n) => (window.cvMediaUrl ? window.cvMediaUrl(p, n) : null),
+    convertChooseFolder: async () => 'D:\\Clips', convertIsMedia: async (n) => n.map(() => true),
     on: (ev, fn) => { (listeners[ev] ||= []).push(fn); return () => { listeners[ev] = listeners[ev].filter((f) => f !== fn); }; },
     _emit: (ev, ...a) => (listeners[ev] || []).forEach((f) => f(...a)),
     _grab: grab, _video: video

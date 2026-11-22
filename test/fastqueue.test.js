@@ -1,4 +1,5 @@
 'use strict';
+const { tmpdir } = require('./helpers/tmp');
 // The queue + the multi-connection downloader together, against a local server that slows each
 // connection down, with real ffmpeg for the format conversions.
 const test = require('node:test');
@@ -26,7 +27,7 @@ const REAL_FFMPEG = ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((p) => fs.
 const REAL_FFPROBE = ['/usr/local/bin/ffprobe', '/usr/bin/ffprobe'].find((p) => fs.existsSync(p));
 
 function setup(extra = {}) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fq-'));
+  const tmp = tmpdir('fq-');
   process.env.FAKE_STATE_DIR = tmp;
   const log = { lines: [], info(m) { this.lines.push(m); }, warn(m) { this.lines.push(m); }, error(m) { this.lines.push(m); } };
   const settings = { ...settingsMod.defaults(tmp), polite: false, retries: 2, minFreeGB: 0, connections: 4, ...extra };
@@ -76,7 +77,7 @@ test('a throttled site: the video comes down over 4 connections, much faster, by
 });
 
 test('formats: MKV and MOV repackaged, MP3 sound taken out (real ffmpeg), all playable', { skip: !REAL_FFMPEG && 'no ffmpeg here' }, async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fqv-'));
+  const tmp = tmpdir('fqv-');
   const src = path.join(tmp, 'real.mp4');
   execFileSync(REAL_FFMPEG, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=4:size=640x360:rate=25', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
     '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', '-movflags', '+faststart', src]);

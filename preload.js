@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (ch, ...a) => ipcRenderer.invoke(ch, ...a);
 const EVENTS = ['queue:item', 'queue:list', 'queue:state', 'queue:idle', 'queue:diskLow', 'queue:needsPass', 'queue:notVideos', 'queue:onlyPreviews', 'engine:step', 'watch:changed',
-  'history:changed', 'log:line', 'clipboard:links', 'app:update', 'lookup:line', 'grab:status', 'pageScan:loop'];
+  'history:changed', 'log:line', 'convert:job', 'convert:previewProgress', 'app:update', 'lookup:line', 'grab:status', 'pageScan:loop'];
 
 contextBridge.exposeInMainWorld('slim', {
   init: () => invoke('init'),
@@ -53,6 +53,19 @@ contextBridge.exposeInMainWorld('slim', {
   openFolder: (sub) => invoke('folder:open', sub),
   openExternal: (url) => invoke('open:external', url),
   pathForFile: (file) => { try { return webUtils.getPathForFile(file); } catch { return null; } },
+
+  convertPick: () => invoke('convert:pick'),
+  convertAddPaths: (paths) => invoke('convert:addPaths', paths),
+  convertStart: (specs) => invoke('convert:start', specs),
+  convertCancel: (id) => invoke('convert:cancel', id),
+  convertClear: () => invoke('convert:clear'),
+  convertList: () => invoke('convert:list'),
+  convertWaveform: (p) => invoke('convert:waveform', p),
+  convertPreview: (p) => invoke('convert:preview', p),
+  convertShow: (p) => invoke('convert:show', p),
+  convertMediaUrl: (p, n) => invoke('convert:mediaUrl', p, n),
+  convertChooseFolder: () => invoke('convert:chooseFolder'),
+  convertIsMedia: (names) => invoke('convert:isMedia', names),
 
   log: () => invoke('log:get'),
   openLogFolder: () => invoke('log:openFolder'),

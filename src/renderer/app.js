@@ -34,7 +34,10 @@ const ICONS = {
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
   retry: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  convert: '<path d="M4 7h13"/><path d="m14 4 3 3-3 3"/><path d="M20 17H7"/><path d="m10 14-3 3 3 3"/>',
+  cut: '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9"/><path d="M14.5 14.5 20 20"/><path d="M8.1 8.1 12 12"/>',
+  back: '<path d="m15 18-6-6 6-6"/>'
 };
 function icon(name, size = 18) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -132,8 +135,7 @@ const state = {
   histTab: 'all',
   histSearch: '',
   freeBytes: null,
-  update: null,
-  clipLinks: null
+  update: null
 };
 
 function applyTheme() {
@@ -196,10 +198,15 @@ function wireEvents() {
   api.on('queue:needsPass', ({ host, count }) => toast(`${count} download${count === 1 ? '' : 's'} from ${host || 'a site'} ${count === 1 ? 'is' : 'are'} waiting for a fresh pass. Use "Open the page" in Channel grab (or your normal browser) and they'll carry on by themselves.`, 12000));
   api.on('watch:changed', (w) => { state.watch = w; if (state.view === 'watch') renderView(); });
   api.on('history:changed', () => { if (state.view === 'history') loadHistory(); });
-  api.on('clipboard:links', (links) => {
-    if (!document.hasFocus()) { state.clipLinks = links; return; }
-    state.clipLinks = links;
-    renderClipBanner();
+  api.on('convert:job', (j) => {
+    const had = cv.jobs.get(j.id);
+    cv.jobs.set(j.id, j);
+    if (j.status === 'done' && (!had || had.status !== 'done')) toast(`Saved: ${cvBase(j.out)}`);
+    if (j.status === 'failed' && (!had || had.status !== 'failed')) toast(`${j.name}: ${j.error}`, 9000);
+    if (state.view === 'convert' && !cv.trimming) renderConvertFiles();
+  });
+  api.on('convert:previewProgress', ({ path: p, pct }) => {
+    if (cv.trimming === p && cv.previewEl && cv.previewEl.isConnected) cv.previewEl.textContent = `This file can't be played here directly: making a quick preview copy… ${Math.round(pct)}%`;
   });
   api.on('grab:status', (t) => {
     if (state.busy) setBusy(t);
@@ -210,7 +217,6 @@ function wireEvents() {
     if (u.newer) { state.update = u; renderUpdateBanner(); }
     else if (u.current) toast(`You're on the latest version (${u.current}).`);
   });
-  window.addEventListener('focus', renderClipBanner);
   setupDragDrop();
   setInterval(refreshFree, 60000);
 }
@@ -285,7 +291,13 @@ function renderSetup(errorText) {
 }
 
 // ---------------------------------------------------------------- shell
-const NAV = [['downloads', 'Downloads', 'download'], ['grab', 'Channel grab', 'grab'], ['watch', 'Channel Watch', 'watch'], ['history', 'History', 'history'], ['settings', 'Settings', 'settings']];
+// Getting videos, then (after a divider) the converter, History and Settings.
+const NAV = [['downloads', 'Downloads', 'download'], ['grab', 'Channel grab', 'grab'], ['watch', 'Channel Watch', 'watch'], '-', ['convert', 'Convert & Trim', 'convert'], ['history', 'History', 'history'], ['settings', 'Settings', 'settings']];
+
+function navButton([key, label, ic]) {
+  return h('button', { type: 'button', class: 'navbtn' + (state.view === key ? ' on' : ''), 'data-view': key, 'aria-current': state.view === key ? 'page' : null, onclick: () => go(key) },
+    icon(ic, 20), label, key === 'downloads' ? h('span', { class: 'badge hidden', id: 'qbadge' }) : null);
+}
 
 function renderShell() {
   const app = document.getElementById('app');
@@ -293,8 +305,7 @@ function renderShell() {
     h('div', { class: 'brand' },
       h('img', { src: 'logo.png', alt: '' }),
       h('div', {}, h('div', { class: 'anton slim' }, 'SLIM'), h('div', { class: 'anton take' }, 'TAKES'))),
-    NAV.map(([key, label, ic]) => h('button', { type: 'button', class: 'navbtn' + (state.view === key ? ' on' : ''), 'data-view': key, 'aria-current': state.view === key ? 'page' : null, onclick: () => go(key) },
-      icon(ic, 20), label, key === 'downloads' ? h('span', { class: 'badge hidden', id: 'qbadge' }) : null)),
+    NAV.map((n) => (n === '-' ? h('div', { class: 'navsep', role: 'separator' }) : navButton(n))),
     h('div', { class: 'sidefoot' },
       h('span', {}, h('span', { class: 'dot' }), 'Engine ready'),
       h('span', { id: 'freespace', text: state.freeBytes != null ? `${fmtBytes(state.freeBytes)} free` : '' }),
@@ -336,26 +347,16 @@ function renderView() {
   const v = document.getElementById('view');
   if (!v) return;
   v.scrollTop = 0;
-  const views = { downloads: viewDownloads, grab: viewGrab, watch: viewWatch, history: viewHistory, settings: viewSettings };
+  const views = { downloads: viewDownloads, grab: viewGrab, watch: viewWatch, convert: viewConvert, history: viewHistory, settings: viewSettings };
+  if (state.view !== 'convert' || !cv.trimming) cvStopPlayer();
   v.replaceChildren(...[].concat(views[state.view]()).filter((x) => x != null && x !== false));
-  renderClipBanner();
+  if (state.view === 'convert' && !cv.trimming) renderConvertFiles();
   renderUpdateBanner();
   if (state.view === 'history') loadHistory();
 }
 
 function topBanners() {
-  return [h('div', { id: 'updatebanner' }), h('div', { id: 'clipbanner' })];
-}
-
-function renderClipBanner() {
-  const box = document.getElementById('clipbanner');
-  if (!box) return;
-  const links = state.clipLinks;
-  if (!links || !links.length) { box.replaceChildren(); return; }
-  box.replaceChildren(h('div', { class: 'banner' },
-    h('span', { class: 'grow' }, links.length === 1 ? `Copied link: ${links[0]}` : `${links.length} copied links`),
-    h('button', { type: 'button', class: 'btn primary', onclick: () => { const l = state.clipLinks; state.clipLinks = null; renderClipBanner(); addLinks(l); } }, 'Add'),
-    h('button', { type: 'button', class: 'btn', onclick: () => { state.clipLinks = null; renderClipBanner(); } }, 'Dismiss')));
+  return [h('div', { id: 'updatebanner' })];
 }
 
 function renderUpdateBanner() {
@@ -1166,8 +1167,7 @@ function viewSettings() {
         h('h2', { class: 'anton' }, 'EXTRAS'),
         chk('sponsorblock', 'Skip sponsor segments (YouTube)'),
         chk('subs', 'Download subtitles (English)'),
-        chk('embed', 'Embed thumbnail and video info in the file'),
-        chk('clipboardWatch', 'Offer to add links I copy')),
+        chk('embed', 'Embed thumbnail and video info in the file')),
 
       h('section', { class: 'card scard', 'aria-label': 'Notifications' },
         h('h2', { class: 'anton' }, 'NOTIFICATIONS'),
@@ -1326,6 +1326,10 @@ function setupDragDrop() {
     e.preventDefault();
     depth = 0;
     document.body.classList.remove('dropzone-on');
+    // Video or audio files: into Convert & Trim.
+    const media = [...(e.dataTransfer.files || [])].filter((f) => CV_MEDIA.test(f.name)).map((f) => api.pathForFile(f)).filter(Boolean);
+    if (media.length) { cvAddPaths(media); return; }
+    if (state.view === 'convert') { toast('Drop video or audio files here to convert or trim them.'); return; }
     let text = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
     for (const f of e.dataTransfer.files || []) {
       if (/\.(txt|csv|md)$/i.test(f.name) && f.size < 5e6) text += '\n' + await f.text();
@@ -1335,6 +1339,618 @@ function setupDragDrop() {
     else toast('No links found in what you dropped.');
   });
 }
+
+// ---------------------------------------------------------------- Convert & Trim
+const CV_VIDEO = [['mp4', 'MP4'], ['mkv', 'MKV'], ['mov', 'MOV'], ['webm', 'WebM']];
+const CV_AUDIO = [['mp3', 'MP3'], ['m4a', 'M4A'], ['flac', 'FLAC'], ['wav', 'WAV'], ['opus', 'Opus']];
+const CV_QUALITY = [['high', 'High'], ['medium', 'Medium'], ['small', 'Small']];
+const CV_KBPS = { mp3: ['320', '192', '128'], m4a: ['256', '192', '128'], opus: ['160', '128', '96'] };
+const CV_MEDIA = /\.(mp4|m4v|mkv|mov|webm|avi|wmv|flv|mpe?g|ts|m2ts|mts|3gp|ogv|mp3|m4a|aac|wav|flac|opus|ogg|oga|wma|aiff?|mka|amr|ac3)$/i;
+const cvAudioFmt = (f) => CV_AUDIO.some(([v]) => v === f);
+const cvExt = (p) => (String(p).match(/\.([^.\\/]+)$/) || [, ''])[1].toLowerCase();
+const cvBase = (p) => String(p).split(/[\\/]/).pop();
+const cvStem = (p) => cvBase(p).replace(/\.[^.]+$/, '');
+function cvStamp(sec) {
+  const s = Math.max(0, Math.round(sec));
+  const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60;
+  const p2 = (n) => String(n).padStart(2, '0');
+  return hh ? `${hh}h${p2(mm)}m${p2(ss)}s` : `${mm}m${p2(ss)}s`;
+}
+/** 125.4 -> "2:05.4"; 3725 -> "1:02:05.0" */
+function cvTime(sec) {
+  if (sec == null || !isFinite(sec)) return '0:00.0';
+  const t = Math.max(0, sec);
+  const hh = Math.floor(t / 3600), mm = Math.floor((t % 3600) / 60), ss = t - hh * 3600 - mm * 60;
+  const s = ss.toFixed(1).padStart(4, '0');
+  return hh ? `${hh}:${String(mm).padStart(2, '0')}:${s}` : `${mm}:${s}`;
+}
+/** "2:05.4", "1:02:05", "125", "125.5" -> seconds; null if it isn't a time. */
+function cvParse(text) {
+  const t = String(text || '').trim();
+  if (!/^\d+(:\d{1,2}){0,2}(\.\d+)?$/.test(t)) return null;
+  const parts = t.split(':').map(Number);
+  return parts.reduce((acc, v) => acc * 60 + v, 0);
+}
+function cvFormatOptions(src) {
+  const same = (v) => (src && cvExt(src) === v ? ' (same)' : '');
+  return [h('optgroup', { label: 'Video' }, CV_VIDEO.map(([v, l]) => h('option', { value: v }, l + same(v)))),
+    h('optgroup', { label: 'Audio only' }, CV_AUDIO.map(([v, l]) => h('option', { value: v }, l + same(v))))];
+}
+function cvFormatSelect(value, onchange, src, attrs = {}) {
+  const s = h('select', { class: 'input', ...attrs, onchange: (e) => onchange(e.target.value) }, cvFormatOptions(src));
+  s.value = value;
+  return s;
+}
+function cvQualitySelect(format, value, onchange) {
+  const k = CV_KBPS[format];
+  if (!k) return null; // FLAC and WAV are lossless: nothing to choose
+  return h('label', { class: 'field' }, 'Audio quality',
+    select(CV_QUALITY.map(([v, l], i) => [v, `${l} (${k[i]} kbps)`]), value, onchange));
+}
+
+const cv = { files: [], jobs: new Map(), trimming: null, previewPct: {}, loaded: false };
+
+function cvFile(p) { return cv.files.find((f) => f.path === p); }
+function cvLastJob(f) { return f && f.job ? cv.jobs.get(f.job) : null; }
+function cvBusy(j) { return j && (j.status === 'waiting' || j.status === 'converting'); }
+/** Why this file can't become the chosen format (or null). */
+function cvProblem(f, format) {
+  if (cvAudioFmt(format) && !f.info.hasAudio) return `No sound in this file, so it can't be made into ${format.toUpperCase()}`;
+  if (!cvAudioFmt(format) && !f.info.hasVideo) return 'No picture in this file: pick an audio format (like MP3)';
+  return null;
+}
+
+async function cvLoad() {
+  if (cv.loaded) return;
+  cv.loaded = true;
+  try { for (const j of await api.convertList()) cv.jobs.set(j.id, j); } catch { /* none yet */ }
+}
+
+/** Add files from the picker or a drop. */
+function cvAddResults(results) {
+  if (!results) return;
+  let added = 0;
+  const bad = [];
+  for (const r of results) {
+    if (!r.ok) { bad.push(`${r.name}: ${r.error}`); continue; }
+    if (cvFile(r.info.path)) continue;
+    cv.files.push({ path: r.info.path, info: r.info, trim: null, job: null });
+    added++;
+  }
+  if (bad.length) toast(bad.length === 1 ? bad[0] : `${bad.length} files couldn't be read (${bad[0]}, …)`, 9000);
+  if (added && state.view === 'convert' && !cv.trimming) renderView();
+  return added;
+}
+async function cvChoose() {
+  const r = await api.convertPick();
+  if (r) { cvAddResults(r); if (state.view !== 'convert') go('convert'); }
+}
+async function cvAddPaths(paths) {
+  if (!paths.length) return;
+  toast(paths.length === 1 ? 'Reading the file…' : `Reading ${paths.length} files…`, 2000);
+  const r = await api.convertAddPaths(paths);
+  cv.trimming = null;
+  if (state.view !== 'convert') go('convert'); else renderView();
+  cvAddResults(r);
+}
+
+async function cvStart(files) {
+  const s = state.settings;
+  const specs = files.map((f) => ({ path: f.path, format: s.convertFormat, quality: s.convertQuality, outDir: s.convertOutDir || null, trim: f.trim }));
+  const made = await api.convertStart(specs);
+  made.forEach((m, i) => {
+    if (m.ok) files[i].job = m.id;
+    else toast(`${cvBase(files[i].path)}: ${m.error}`, 8000);
+  });
+  renderConvertFiles();
+}
+
+function cvSaveSetting(patch) {
+  Object.assign(state.settings, patch);
+  api.setSettings(patch).catch(() => {});
+}
+
+function viewConvert() {
+  cvLoad();
+  if (cv.trimming && cvFile(cv.trimming)) return viewTrim(cvFile(cv.trimming));
+  cv.trimming = null;
+  const s = state.settings;
+  const fmt = s.convertFormat || 'mp3';
+  const saveTo = s.convertOutDir ? 'folder' : 'next';
+  const saveSel = h('select', {
+    class: 'input',
+    onchange: async (e) => {
+      if (e.target.value === 'next') cvSaveSetting({ convertOutDir: '' });
+      else if (e.target.value === 'pick') {
+        const d = await api.convertChooseFolder();
+        if (d) cvSaveSetting({ convertOutDir: d });
+      }
+      renderView();
+    }
+  }, h('option', { value: 'next' }, 'Next to the original'),
+  s.convertOutDir ? h('option', { value: 'folder' }, s.convertOutDir) : null,
+  h('option', { value: 'pick' }, 'Choose a folder…'));
+  saveSel.value = saveTo;
+
+  const drop = h('section', { class: 'cv-drop', 'aria-label': 'Add files' },
+    icon('download', 40),
+    h('div', { class: 'cv-drop-title' }, 'Drop video or audio files here'),
+    h('div', { class: 'small mute' }, 'MP4, MKV, MOV, WebM, AVI · MP3, M4A, WAV, FLAC, Opus · several at once is fine'),
+    h('button', { type: 'button', class: 'btn primary big', onclick: cvChoose }, 'Choose files…'));
+
+  return [
+    ...topBanners(),
+    h('div', { class: 'head' }, h('h1', { class: 'anton' }, 'CONVERT & TRIM'),
+      h('span', { class: 'mute' }, 'Change a file\'s format, take the sound out, or keep just one part. Your original is never changed.')),
+    drop,
+    h('section', { class: 'card row cv-out', 'aria-label': 'Output', style: { alignItems: 'flex-end', gap: '14px' } },
+      h('label', { class: 'field' }, 'Convert to', cvFormatSelect(fmt, (v) => { cvSaveSetting({ convertFormat: v }); renderView(); })),
+      cvQualitySelect(fmt, s.convertQuality || 'high', (v) => cvSaveSetting({ convertQuality: v })),
+      h('label', { class: 'field grow', style: { minWidth: '240px' } }, 'Save to', saveSel),
+      // Trim, as big as Convert and right beside it (for the one file in the list).
+      h('button', { type: 'button', class: 'btn big trimbig hidden', id: 'cv-trim', onclick: () => { const f = cvTrimmable()[0]; if (f) { cv.trimming = f.path; renderView(); } } }, icon('cut', 18), 'Trim'),
+      h('button', { type: 'button', class: 'btn primary big', id: 'cv-go', onclick: () => cvStart(cvReady()) }, 'Convert')),
+    h('section', { 'aria-label': 'Files', class: 'col', style: { gap: '10px' } },
+      h('div', { class: 'head' }, h('h2', { class: 'anton' }, 'FILES'), h('span', { class: 'mute', id: 'cv-sum' }),
+        h('button', { type: 'button', class: 'btn', style: { marginLeft: 'auto' }, onclick: cvClearFinished }, 'Clear finished'),
+        h('button', { type: 'button', class: 'btn', onclick: cvRemoveAll }, icon('x', 16), 'Remove all')),
+      h('div', { id: 'cv-files', class: 'col', style: { gap: '10px' } })),
+    h('footer', { class: 'row small mute', style: { marginTop: 'auto', borderTop: '1px solid var(--line)', paddingTop: '10px' } },
+      'Changing between video formats (like MKV to MP4) usually takes seconds and loses no quality.')
+  ];
+}
+
+/** Files that can be trimmed right now (not converting at the moment). */
+function cvTrimmable() { return cv.files.filter((f) => !cvBusy(cvLastJob(f))); }
+
+/** Files that would be converted by the big button. */
+function cvReady() {
+  const fmt = state.settings.convertFormat || 'mp3';
+  return cv.files.filter((f) => { const j = cvLastJob(f); return !cvBusy(j) && !(j && j.status === 'done') && !cvProblem(f, fmt); });
+}
+
+/** Take every file off the list (stops any that are converting; nothing is deleted from the PC). */
+function cvRemoveAll() {
+  for (const f of cv.files) { const j = cvLastJob(f); if (cvBusy(j)) api.convertCancel(j.id); }
+  cv.files = [];
+  renderConvertFiles();
+}
+
+function cvClearFinished() {
+  cv.files = cv.files.filter((f) => { const j = cvLastJob(f); return cvBusy(j) || !j; });
+  api.convertClear().catch(() => {});
+  renderConvertFiles();
+}
+
+function renderConvertFiles() {
+  const box = document.getElementById('cv-files');
+  if (!box) return;
+  const fmt = state.settings.convertFormat || 'mp3';
+  const ready = cvReady();
+  const goBtn = document.getElementById('cv-go');
+  if (goBtn) { goBtn.textContent = ready.length ? `Convert ${ready.length} file${ready.length === 1 ? '' : 's'}` : 'Convert'; goBtn.disabled = !ready.length; }
+  // The big Trim button: there when there's one file to trim (with several, each file has its own).
+  const trimBtn = document.getElementById('cv-trim');
+  if (trimBtn) {
+    const one = cv.files.length === 1 && cvTrimmable().length === 1 ? cv.files[0] : null;
+    trimBtn.classList.toggle('hidden', !one);
+    if (one) trimBtn.replaceChildren(icon('cut', 18), one.trim ? `Trim (${fmtDur(one.trim.start)} – ${fmtDur(one.trim.end)})` : 'Trim');
+  }
+  const counts = { done: 0, converting: 0, waiting: 0, ready: ready.length, failed: 0 };
+  for (const f of cv.files) { const j = cvLastJob(f); if (j && counts[j.status] != null) counts[j.status]++; }
+  const sum = document.getElementById('cv-sum');
+  if (sum) sum.textContent = cv.files.length ? [counts.done && `${counts.done} done`, counts.converting && `${counts.converting} converting`, counts.waiting && `${counts.waiting} waiting`, counts.failed && `${counts.failed} failed`, counts.ready && `${counts.ready} ready`].filter(Boolean).join(' · ') : '';
+  if (!cv.files.length) {
+    box.replaceChildren(h('div', { class: 'card mute', style: { textAlign: 'center', padding: '22px' } }, 'No files yet. Drop some on the window, or use Choose files.'));
+    return;
+  }
+  box.replaceChildren(...cv.files.map((f) => {
+    const j = cvLastJob(f);
+    const problem = !j || !cvBusy(j) ? cvProblem(f, j && j.status === 'done' ? j.format : fmt) : null;
+    const target = (j && (cvBusy(j) || j.status === 'done') ? j.format : fmt).toUpperCase();
+    const cut = f.trim ? ` · cut ${fmtDur(f.trim.start)} to ${fmtDur(f.trim.end)}` : '';
+    const info = `${fmtDur(f.info.duration)} · ${fmtBytes(f.info.size)} → ${target}${cut}`;
+    let pct = 0, barCls = '', detail = 'Ready', status = 'Ready', stCls = 'mute';
+    if (problem && !(j && j.status === 'done')) { detail = problem; status = 'Can\'t'; stCls = 'err'; }
+    if (j) {
+      if (j.status === 'waiting') { detail = 'Waiting for the one before it'; status = 'Waiting'; }
+      if (j.status === 'converting') { pct = j.pct || 0; detail = `${j.mode === 'copy' ? 'Repackaging' : 'Converting'}${j.eta != null ? ' · ' + fmtEta(j.eta) : ''}`; status = 'Converting'; stCls = 'acc'; }
+      if (j.status === 'done') { pct = 100; barCls = 'okbar'; detail = `Saved: ${cvBase(j.out)}`; status = 'Done'; stCls = 'ok'; }
+      if (j.status === 'failed') { detail = j.error || 'Didn\'t work'; status = 'Failed'; stCls = 'err'; }
+      if (j.status === 'canceled') { detail = 'Canceled'; status = 'Canceled'; }
+    }
+    const busy = cvBusy(j);
+    return h('div', { class: 'card qitem cv-item' },
+      h('div', { class: 'cv-kind', text: (cvExt(f.path) || '?').toUpperCase().slice(0, 4) }),
+      h('div', { class: 'grow col' },
+        h('div', { class: 'row', style: { gap: '10px', alignItems: 'baseline' } }, h('span', { class: 'title', style: { fontWeight: 600 }, text: f.info.name }), h('span', { class: 'small mute', text: info })),
+        h('div', { class: 'bar ' + barCls }, h('div', { style: { width: pct + '%' } })),
+        h('span', { class: 'small mute selectable', text: detail })),
+      h('span', { class: 'cv-status ' + stCls, text: status }),
+      j && j.status === 'done' ? h('button', { type: 'button', class: 'btn', onclick: () => api.convertShow(j.out) }, icon('folder', 16), 'Show') : null,
+      !busy ? h('button', { type: 'button', class: 'btn trimbtn', onclick: () => { cv.trimming = f.path; renderView(); } }, icon('cut', 16), f.trim ? `${fmtDur(f.trim.start)} – ${fmtDur(f.trim.end)}` : 'Trim') : null,
+      // Remove: an obvious X in the corner. Only takes it off the list (stops it first if converting).
+      h('button', { type: 'button', class: 'cv-remove', 'aria-label': `Remove ${f.info.name} from the list`, title: busy ? 'Stop and remove' : 'Remove from the list',
+        onclick: () => { if (busy) api.convertCancel(j.id); cv.files = cv.files.filter((x) => x !== f); renderConvertFiles(); } }, icon('x', 18)));
+  }));
+}
+
+// ---- Trim
+/** Leaving the trim screen (or redrawing it): stop the player and the keyboard shortcut. */
+function cvStopPlayer() {
+  const P = cv.player;
+  if (!P) return;
+  clearTimeout(P.stallTimer); clearTimeout(P.seekTimer);
+  if (P.keys) window.removeEventListener('keydown', P.keys);
+  try { P.media.pause(); P.media.removeAttribute('src'); P.media.load(); } catch { /* gone */ }
+  cancelAnimationFrame(P.raf);
+  cv.player = null; cv.onResize = null;
+}
+
+function viewTrim(f) {
+  cvStopPlayer();
+  const info = f.info;
+  const isVideo = info.hasVideo;
+  const total = info.duration || 0;
+  const t = f.trimDraft || (f.trimDraft = { start: f.trim ? f.trim.start : 0, end: f.trim ? f.trim.end : total, fast: f.trim ? !!f.trim.fast : false });
+  const media = h(isVideo ? 'video' : 'audio', { class: isVideo ? 'cv-video' : 'hidden', preload: 'auto', playsinline: '' });
+  // The file comes from the app's private local server (the player is reliable that way); every
+  // reload asks for a new address, because the player can refuse to load the same one again.
+  let loads = 0;
+  const loadFrom = async (file) => {
+    const n = ++loads;
+    let u = null;
+    try { u = await api.convertMediaUrl(file, n); } catch { /* fall back below */ }
+    if (cv.player && cv.player.media !== media) return;
+    media.src = u || fileUrl(file) + (n > 1 ? '#r' + n : '');
+  };
+  loadFrom(f.previewSrc || info.path);
+  const status = h('div', { class: 'small mute', id: 'cv-pv', 'aria-live': 'polite' });
+  const say = (m) => { status.textContent = m || ''; };
+  const P = cv.player = { media, reloads: 0, lastReload: 0, stallTimer: null, seekTimer: null, keys: null };
+  const clamp = (x) => Math.max(0, Math.min(total || 0, x));
+
+  // ---- the player: play/pause, jumping, and getting it going again if it gets stuck
+  /** Jump to a time and wait until the picture is there (gives up waiting after 4 s). */
+  const seekTo = (sec) => new Promise((resolve) => {
+    sec = clamp(sec);
+    if (!media.seeking && Math.abs(media.currentTime - sec) < 0.02) return resolve(true);
+    let done = false;
+    const fin = (ok) => { if (done) return; done = true; media.removeEventListener('seeked', on); clearTimeout(tm); resolve(ok); };
+    const on = () => fin(true);
+    media.addEventListener('seeked', on);
+    const tm = setTimeout(() => fin(false), 4000);
+    media.currentTime = sec;
+  });
+  /** The player got stuck: load the file again at the same spot, a few tries in a row if needed. */
+  const rescue = async (why) => {
+    if (cv.player !== P || P.rescuing) return;
+    if (P.reloads >= 12) { say('The player keeps getting stuck on this file. You can still type the times and save the clip.'); return; }
+    P.rescuing = true;
+    const at = media.currentTime || t.start;
+    const resume = why === 'play' || !media.paused || P.wantPlay;
+    say('Reloading the video…');
+    try {
+      for (let attempt = 0; attempt < 4 && cv.player === P; attempt++) {
+        P.reloads++;
+        media.removeAttribute('src'); media.load();
+        await loadFrom(f.previewSrc || info.path);
+        const loaded = await new Promise((r) => {
+          const ok = () => { clearTimeout(tm); media.removeEventListener('loadedmetadata', ok); r(true); };
+          const tm = setTimeout(() => { media.removeEventListener('loadedmetadata', ok); r(false); }, 6000);
+          media.addEventListener('loadedmetadata', ok);
+        });
+        if (cv.player !== P) return;
+        if (!loaded || !(await seekTo(at))) continue;
+        if (!resume) { say(''); return; }
+        try { await media.play(); say(''); return; } catch { /* try again */ }
+      }
+      if (cv.player === P) say('The player got stuck on this file. Press play to try again, or type the times and save the clip.');
+    } finally { P.rescuing = false; }
+  };
+  // Play = your selection, from its start to its end, over and over until you pause.
+  // Only pausing stops it: dragging the bars or the play position never does.
+  const play = async () => {
+    P.wantPlay = true;
+    showPlaying(true);
+    const ok = await seekTo(t.start);
+    if (!ok) await rescue('seek');
+    if (!P.wantPlay || cv.player !== P) return;
+    try { await media.play(); say(''); } catch (e) { if (!(e && e.name === 'AbortError')) await rescue('play'); }
+  };
+  const pause = () => { P.wantPlay = false; media.pause(); showPlaying(false); };
+  // Each press flips what you asked for (even mid-jump, before the picture has started moving).
+  const toggle = () => (P.wantPlay ? pause() : play());
+  /** Back to the start of the selection when playing reaches its end (checked every frame, so it's tight). */
+  const loopCheck = () => {
+    if (cv.player !== P) return;
+    if (!media.paused && !P.scrubbing && !P.dragBar && !P.looping && media.currentTime >= t.end - 0.02) {
+      P.looping = true;
+      seekTo(t.start).then(() => { P.looping = false; if (P.wantPlay && media.paused) media.play().catch(() => {}); });
+    }
+    P.raf = requestAnimationFrame(loopCheck);
+  };
+  media.addEventListener('play', () => { P.wantPlay = true; cancelAnimationFrame(P.raf); P.raf = requestAnimationFrame(loopCheck); });
+  media.addEventListener('pause', () => { if (!P.looping && !media.seeking && !P.scrubbing && !P.dragBar && media.currentTime < total - 0.05) P.wantPlay = false; });
+  // A selection that runs to the very end of the file: the player stops there by itself, so start it again.
+  media.addEventListener('ended', () => { if (P.wantPlay) { P.looping = true; seekTo(t.start).then(() => { P.looping = false; media.play().catch(() => {}); }); } });
+  // Stuck waiting for data for 5 s while playing, or a jump that never finishes: reload.
+  media.addEventListener('waiting', () => {
+    clearTimeout(P.stallTimer);
+    const at = media.currentTime;
+    P.stallTimer = setTimeout(() => { if (cv.player === P && !media.paused && Math.abs(media.currentTime - at) < 0.05) rescue('stall'); }, 5000);
+  });
+  media.addEventListener('playing', () => clearTimeout(P.stallTimer));
+  media.addEventListener('seeking', () => { clearTimeout(P.seekTimer); P.seekTimer = setTimeout(() => { if (cv.player === P && media.seeking) rescue('seek'); }, 5000); });
+  media.addEventListener('seeked', () => clearTimeout(P.seekTimer));
+  // A file the player can't show at all: a quick preview copy (made once, kept for this file).
+  let triedPreview = !!f.previewSrc;
+  media.addEventListener('error', async () => {
+    if (cv.player !== P) return;
+    if (triedPreview) { say('This file can\'t be shown here, but you can still type the times and save the clip.'); return; }
+    triedPreview = true;
+    say('This file can\'t be played here directly: making a quick preview copy…');
+    try {
+      const pv = await api.convertPreview(info.path);
+      f.previewSrc = pv;
+      if (cv.player !== P) return;
+      say('');
+      loadFrom(pv);
+    } catch (e) { say('Couldn\'t make a preview (' + ((e && e.message) || e) + '). You can still type the times and save the clip.'); }
+  });
+  cv.previewEl = status;
+
+  // Play / pause: a big round button under the picture, a play button over the picture when paused,
+  // clicking the picture, and the space bar.
+  const playBtn = h('button', { type: 'button', class: 'cv-play', 'aria-label': 'Play', title: 'Play / pause (space bar)', onclick: toggle }, icon('play', 22));
+  const bigPlay = isVideo ? h('button', { type: 'button', class: 'cv-bigplay', 'aria-label': 'Play', onclick: toggle }, icon('play', 34)) : null;
+  const showPlaying = (on) => {
+    on = on || P.wantPlay;
+    playBtn.replaceChildren(icon(on ? 'pause' : 'play', 22));
+    playBtn.setAttribute('aria-label', on ? 'Pause' : 'Play');
+    if (bigPlay) bigPlay.classList.toggle('hidden', on);
+  };
+  media.addEventListener('play', () => showPlaying(true));
+  media.addEventListener('pause', () => showPlaying(false));
+  if (isVideo) media.addEventListener('click', toggle);
+  P.keys = (e) => {
+    if (e.code !== 'Space' || e.repeat) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    if (/INPUT|TEXTAREA|SELECT|BUTTON/.test(tag)) return; // typing a time, or a button that space presses
+    e.preventDefault();
+    toggle();
+  };
+  window.addEventListener('keydown', P.keys);
+
+  const clock = h('span', { class: 'cv-clock', text: `${cvTime(0)} / ${cvTime(total)}` });
+
+  // ---- the timeline: selection, two handles, play position; the sound's shape behind it for audio
+  const sel = h('div', { class: 'cv-sel' });
+  // The play position: a white line with a knob on top that you can drag to move through the video.
+  const head = h('div', { class: 'cv-head', role: 'slider', tabindex: '0', 'aria-label': 'Play position', 'aria-valuemin': '0', 'aria-valuemax': String(Math.round(total)), 'aria-valuenow': '0' }, h('span', { class: 'cv-knob', 'aria-hidden': 'true' }));
+  const hStart = h('button', { type: 'button', class: 'cv-handle', 'aria-label': 'Start of the cut' });
+  const hEnd = h('button', { type: 'button', class: 'cv-handle', 'aria-label': 'End of the cut' });
+  const canvas = isVideo ? null : h('canvas', { class: 'cv-wave', 'aria-hidden': 'true' });
+  const track = h('div', { class: 'cv-track' + (isVideo ? '' : ' tall'), role: 'group', 'aria-label': 'Timeline' }, canvas, sel, head, hStart, hEnd);
+  let peaks = null;
+  const startIn = h('input', { class: 'input cv-timein', type: 'text', 'aria-label': 'Start time', value: cvTime(t.start) });
+  const endIn = h('input', { class: 'input cv-timein', type: 'text', 'aria-label': 'End time', value: cvTime(t.end) });
+  const keeps = h('span', { class: 'mute' });
+  const savesAs = h('span', { class: 'small mute selectable' });
+
+  const pctOf = (sec) => (total ? (sec / total) * 100 : 0);
+  const drawWave = () => {
+    if (!canvas || !peaks || !canvas.isConnected) return;
+    const w = canvas.clientWidth || 800, ht = canvas.clientHeight || 200, dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(ht * dpr);
+    const g = canvas.getContext('2d');
+    g.scale(dpr, dpr);
+    const css = getComputedStyle(document.documentElement);
+    const on = css.getPropertyValue('--acc').trim() || '#ff3b3b', off = css.getPropertyValue('--line').trim() || '#4a4652';
+    const n = Math.max(40, Math.floor(w / 4));
+    const bw = w / n;
+    for (let i = 0; i < n; i++) {
+      const v = peaks[Math.floor((i * peaks.length) / n)] || 0;
+      const bh = Math.max(2, v * (ht - 16));
+      const mid = ((i + 0.5) / n) * total;
+      g.fillStyle = mid >= t.start && mid <= t.end ? on : off;
+      g.fillRect(i * bw + 0.5, (ht - bh) / 2, Math.max(1, bw - 1.5), bh);
+    }
+  };
+  // Save as: what you picked here; else a video stays a video (its own format if it's one of ours,
+  // else MP4), and audio stays audio (the Convert-to choice if that's audio, else its own or MP3).
+  const defaultFormat = () => {
+    const ext = cvExt(info.path), global = state.settings.convertFormat || 'mp3';
+    if (isVideo) return CV_VIDEO.some(([v]) => v === ext) ? ext : 'mp4';
+    if (cvAudioFmt(global)) return global;
+    return cvAudioFmt(ext) ? ext : 'mp3';
+  };
+  const fmtNow = () => f.trimFormat || defaultFormat();
+  const paint = () => {
+    sel.style.left = pctOf(t.start) + '%';
+    sel.style.width = Math.max(0, pctOf(t.end) - pctOf(t.start)) + '%';
+    hStart.style.left = pctOf(t.start) + '%';
+    hEnd.style.left = pctOf(t.end) + '%';
+    hStart.setAttribute('aria-label', 'Start of the cut: ' + cvTime(t.start));
+    hEnd.setAttribute('aria-label', 'End of the cut: ' + cvTime(t.end));
+    if (document.activeElement !== startIn) startIn.value = cvTime(t.start);
+    if (document.activeElement !== endIn) endIn.value = cvTime(t.end);
+    keeps.replaceChildren('Keeps ', h('b', { text: fmtDur(t.end - t.start) }));
+    const whole = t.start < 0.05 && t.end >= total - 0.05;
+    const dir = state.settings.convertOutDir ? `in ${state.settings.convertOutDir}` : 'next to the original';
+    savesAs.textContent = `Saves as ${cvStem(info.path)}${whole ? '' : ` (${cvStamp(t.start)}-${cvStamp(t.end)})`}.${fmtNow()} ${dir}`;
+    drawWave();
+  };
+  const setT = (which, sec) => {
+    sec = clamp(sec);
+    if (which === 'start') t.start = Math.min(sec, t.end - 0.1);
+    else t.end = Math.max(sec, t.start + 0.1);
+    t.start = Math.max(0, t.start); t.end = Math.min(total, t.end);
+    paint();
+  };
+  // Where the picture goes for a handle: the start itself; a couple of seconds before the end
+  // (so you see the end of the cut, and the video never runs off its end and stops).
+  const lookAt = (which) => (which === 'start' ? t.start : Math.max(t.start, t.end - 2));
+  const secAt = (clientX) => { const r = track.getBoundingClientRect(); return ((clientX - r.left) / Math.max(1, r.width)) * total; };
+  for (const [el, which] of [[hStart, 'start'], [hEnd, 'end']]) {
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      el.setPointerCapture(e.pointerId);
+      // The video keeps playing (or stays paused) while you drag; the picture follows the bar a few
+      // times a second (never dozens of jumps a second, which is what made the player get stuck).
+      // The selection's loop waits until you let go (or it would jump back and forth as the bar moves).
+      P.dragBar = true;
+      let last = 0;
+      const move = (ev) => {
+        setT(which, secAt(ev.clientX));
+        // A rough preview of the frame now and then while dragging (only when the player isn't busy).
+        if (isVideo && Date.now() - last > 300 && !media.seeking) { last = Date.now(); if (typeof media.fastSeek === 'function') media.fastSeek(lookAt(which)); else media.currentTime = lookAt(which); }
+      };
+      const up = () => {
+        el.removeEventListener('pointermove', move); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up);
+        P.dragBar = false;
+        // Left bar: carry on from the new start. Right bar: show the last couple of seconds of the cut.
+        seekTo(lookAt(which)).then((ok) => { if (!ok) rescue('seek'); else if (P.wantPlay && media.paused) media.play().catch(() => {}); });
+      };
+      el.addEventListener('pointermove', move); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+    });
+    el.addEventListener('keydown', (e) => {
+      const step = e.shiftKey ? 0.1 : 1;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); setT(which, t[which] + (e.key === 'ArrowLeft' ? -step : step)); }
+    });
+    el.addEventListener('keyup', (e) => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') seekTo(lookAt(which)); });
+  }
+  // Drag the white line (or press anywhere on the timeline) to move through the video.
+  const scrubTo = (sec, final) => {
+    sec = clamp(sec);
+    head.style.left = pctOf(sec) + '%';
+    clock.textContent = `${cvTime(sec)} / ${cvTime(total)}`;
+    if (final) return seekTo(sec).then((ok) => { if (!ok) rescue('seek'); else if (P.wantPlay && media.paused) media.play().catch(() => {}); });
+    if (Date.now() - (P.lastScrub || 0) > 250 && !media.seeking) { P.lastScrub = Date.now(); media.currentTime = sec; }
+    return null;
+  };
+  track.addEventListener('pointerdown', (e) => {
+    if (e.target === hStart || e.target === hEnd) return;
+    e.preventDefault();
+    track.setPointerCapture(e.pointerId);
+    P.scrubbing = true;
+    let at = secAt(e.clientX);
+    scrubTo(at, false);
+    const move = (ev) => { at = secAt(ev.clientX); scrubTo(at, false); };
+    const up = () => {
+      track.removeEventListener('pointermove', move); track.removeEventListener('pointerup', up); track.removeEventListener('pointercancel', up);
+      P.scrubbing = false;
+      scrubTo(at, true);
+    };
+    track.addEventListener('pointermove', move); track.addEventListener('pointerup', up); track.addEventListener('pointercancel', up);
+  });
+  head.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 1 : 5;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); scrubTo(media.currentTime + (e.key === 'ArrowLeft' ? -step : step), true); }
+  });
+  const onTime = () => {
+    if (P.scrubbing) return;
+    head.style.left = pctOf(media.currentTime) + '%';
+    head.setAttribute('aria-valuenow', String(Math.round(media.currentTime)));
+    clock.textContent = `${cvTime(media.currentTime)} / ${cvTime(total)}`;
+  };
+  media.addEventListener('timeupdate', onTime);
+  media.addEventListener('seeked', onTime);
+  for (const [el, which] of [[startIn, 'start'], [endIn, 'end']]) {
+    el.addEventListener('change', () => {
+      const v = cvParse(el.value);
+      if (v == null) { toast('Type a time like 2:05 or 1:02:05.5'); el.value = cvTime(t[which]); return; }
+      setT(which, v);
+      el.value = cvTime(t[which]);
+      seekTo(lookAt(which));
+    });
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.blur(); });
+  }
+  if (canvas) {
+    api.convertWaveform(info.path).then((p) => { peaks = p; drawWave(); }).catch(() => say('Couldn\'t draw the sound\'s shape, but trimming still works.'));
+    cv.onResize = drawWave;
+  }
+
+  // ---- saving: format, Exact/Fast, quality (changes here don't reload the player)
+  const back = () => {
+    const whole = t.start < 0.05 && t.end >= total - 0.05;
+    f.trim = whole ? null : { start: t.start, end: t.end, fast: t.fast };
+    f.trimDraft = null;
+    cv.trimming = null;
+    cvStopPlayer();
+    renderView();
+  };
+  const save = async () => {
+    const whole = t.start < 0.05 && t.end >= total - 0.05;
+    const spec = { path: info.path, format: fmtNow(), quality: state.settings.convertQuality, outDir: state.settings.convertOutDir || null, trim: whole ? null : { start: t.start, end: t.end, fast: t.fast } };
+    const [m] = await api.convertStart([spec]);
+    if (!m.ok) { toast(m.error, 8000); return; }
+    f.job = m.id;
+    toast('Saving the clip…');
+    back();
+  };
+  let saveArea = null;
+  const buildSave = () => {
+    const fmt = fmtNow();
+    const audioOut = cvAudioFmt(fmt);
+    const problem = cvProblem(f, fmt);
+    const cutChoice = !audioOut && isVideo
+      ? h('div', { class: 'field', role: 'radiogroup', 'aria-label': 'Cut' }, 'Cut',
+        h('div', { class: 'seg' },
+          ...[['Exact', false], ['Fast', true]].map(([label, fast]) => h('button', {
+            type: 'button', role: 'radio', 'aria-checked': String(t.fast === fast), class: 'segbtn' + (t.fast === fast ? ' on' : ''),
+            onclick: () => { t.fast = fast; rebuildSave(); }
+          }, label))))
+      : null;
+    const help = audioOut || !isVideo ? 'Audio cuts are always exact.'
+      : t.fast ? 'Done in seconds with no quality loss, but may start up to a couple of seconds early.'
+        : 'Cuts on the exact frame you picked. Takes a little longer.';
+    return h('div', { class: 'col', style: { gap: '8px' } },
+      h('section', { class: 'card row', 'aria-label': 'Save the clip', style: { alignItems: 'flex-end', gap: '14px' } },
+        cutChoice,
+        h('span', { class: 'grow small mute', style: { paddingBottom: '12px', minWidth: '220px' }, text: help }),
+        h('label', { class: 'field' }, 'Save as', cvFormatSelect(fmt, (v) => { f.trimFormat = v; rebuildSave(); paint(); }, info.path)),
+        audioOut ? cvQualitySelect(fmt, state.settings.convertQuality || 'high', (v) => cvSaveSetting({ convertQuality: v })) : null,
+        h('button', { type: 'button', class: 'btn primary big', onclick: save, disabled: !!problem }, icon('cut', 18), 'Save clip')),
+      problem ? h('div', { class: 'err small', text: problem }) : null);
+  };
+  const rebuildSave = () => { const n = buildSave(); if (saveArea) saveArea.replaceWith(n); saveArea = n; };
+  saveArea = buildSave();
+
+  const controls = h('div', { class: 'row cv-controls' },
+    playBtn, clock,
+    h('span', { class: 'small mute', style: { marginLeft: 'auto' }, text: 'Play loops your selection until you pause' }));
+
+  const el = [
+    ...topBanners(),
+    h('div', { class: 'head' },
+      h('button', { type: 'button', class: 'btn icon', 'aria-label': 'Back to Convert & Trim', onclick: back }, icon('back', 18)),
+      h('div', { class: 'col', style: { gap: '2px', minWidth: 0 } },
+        h('h1', { class: 'anton', style: { fontSize: '30px' } }, 'TRIM'),
+        h('span', { class: 'mute', text: `${info.name} · ${fmtDur(total)} · ${isVideo ? (info.height ? info.height + 'p' : 'video') : 'audio'}` })),
+      // Remove this file from the list and go back to the drop screen (nothing is deleted from the PC).
+      h('button', { type: 'button', class: 'btn cv-remove-top', style: { marginLeft: 'auto' }, title: 'Remove this file from the list', 'aria-label': `Remove ${info.name} from the list`,
+        onclick: () => { cv.files = cv.files.filter((x) => x !== f); f.trimDraft = null; cv.trimming = null; cvStopPlayer(); renderView(); } }, icon('x', 18), 'Remove')),
+    h('section', { class: 'card col cv-trim', 'aria-label': isVideo ? 'Preview' : 'Waveform', style: { gap: '14px' } },
+      isVideo ? h('div', { class: 'cv-screen' }, media, bigPlay) : media,
+      controls,
+      status,
+      track,
+      h('div', { class: 'row small mute', style: { justifyContent: 'space-between' } }, [0, 0.25, 0.5, 0.75, 1].map((k) => h('span', { text: fmtDur(total * k) }))),
+      h('div', { class: 'row', style: { alignItems: 'flex-end', gap: '12px' } },
+        h('label', { class: 'field' }, 'Start', startIn),
+        h('button', { type: 'button', class: 'btn', onclick: () => setT('start', media.currentTime || 0) }, 'Set start here'),
+        h('label', { class: 'field' }, 'End', endIn),
+        h('button', { type: 'button', class: 'btn', onclick: () => setT('end', media.currentTime || total) }, 'Set end here'),
+        h('span', { style: { paddingBottom: '10px' } }, keeps),
+        h('button', { type: 'button', class: 'btn', style: { marginLeft: 'auto' }, onclick: () => { t.start = 0; t.end = total; paint(); } }, 'Reset'))),
+    saveArea,
+    savesAs
+  ];
+  requestAnimationFrame(paint);
+  return el;
+}
+window.addEventListener('resize', () => { if (cv.onResize) cv.onResize(); });
 
 boot().catch((e) => {
   document.getElementById('app').replaceChildren(h('div', { class: 'fullcenter' }, h('div', { class: 'setup' },

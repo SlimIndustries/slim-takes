@@ -196,11 +196,11 @@ class Queue extends EventEmitter {
 
   resume(id) {
     const it = this.find(id);
-    if (it && it.stopReason === 'pause' && this.procs.has(it.id)) { it.resumeAfterStop = true; return; }
+    if (it && it.stopReason === 'pause' && (this.procs.has(it.id) || it.status === 'starting')) { it.resumeAfterStop = true; return; }
     if (it && (it.status === 'paused' || it.status === 'failed' || it.status === 'canceled')) {
       if (it.status !== 'paused') it.attempts = 0;
       it.status = 'waiting'; it.error = null; it.note = null; it.retryAt = 0;
-      if (it.heldForPass) { it.heldForPass = false; this.heldHosts.delete(hostOf(it.url)); this.badStreak.delete(hostOf(it.url)); }
+      if (it.heldForPass) { it.heldForPass = false; this.heldHosts.delete(hostOf(it.url)); this.badStreak.delete(hostOf(it.url)); this.viaWindow(it); }
       if (this.paused) { this.paused = false; this.emit('state'); }
       this.changed(it); this.pump();
     }
@@ -282,11 +282,11 @@ class Queue extends EventEmitter {
   resumeAll() {
     this.paused = false;
     for (const it of this.items) {
-      // Still stopping from a pause a moment ago: carry on once it has stopped.
-      if (it.stopReason === 'pause' && this.procs.has(it.id)) { it.resumeAfterStop = true; continue; }
+      // Still stopping (or still getting ready) from a pause a moment ago: carry on once it has stopped.
+      if (it.stopReason === 'pause' && (this.procs.has(it.id) || it.status === 'starting')) { it.resumeAfterStop = true; continue; }
       if (it.status !== 'paused') continue;
       it.status = 'waiting';
-      if (it.heldForPass) { it.heldForPass = false; it.note = null; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; }
+      if (it.heldForPass) { it.heldForPass = false; it.note = null; it.directRetried = false; it.engineFallback = false; it.triedWindow = false; this.viaWindow(it); }
     }
     this.heldHosts.clear();
     this.badStreak.clear();
@@ -521,6 +521,12 @@ class Queue extends EventEmitter {
     this.pump();
   }
 
+  /** A video that was held because its site sent web pages (or needed a pass): when it carries on, it
+   *  goes straight through the page window, never the engine first (that's what got it held). */
+  viaWindow(it) {
+    if (this.resolveDirect && !it.direct) it.needWindow = true;
+  }
+
   /** The user got a fresh pass for a site: carry on with its held downloads. */
   releaseSite(urlOrHost) {
     const host = /^https?:/i.test(urlOrHost) ? hostOf(urlOrHost) : urlOrHost;
@@ -529,6 +535,7 @@ class Queue extends EventEmitter {
       if (x.heldForPass && hostOf(x.url) === host) {
         x.status = 'waiting'; x.heldForPass = false; x.note = null; x.error = null;
         x.directRetried = false; x.engineFallback = false; x.cfRetried = false; x.triedWindow = false; x.windowError = null; x.attempts = 0;
+        this.viaWindow(x);
         n++;
         this.changed(x);
       }
@@ -575,6 +582,8 @@ class Queue extends EventEmitter {
 
     const concurrent = Math.max(1, Number(s.concurrent) || 3);
     const connections = Math.max(1, Math.min(16, Number(s.connections) || 8));
+    // Paused or canceled while it was getting ready: don't start the download at all.
+    if (it.stopReason) return this.finishRun(it, 1, { done: null, errors: [], skipped: null });
     // A single video file from a page: fetch it over several connections (sites often slow each one down).
     // Streams, speed limits and anything that failed this way go through the engine as before.
     if (it.direct && !isStreamUrl(it.direct.mediaUrl) && connections > 1 && !s.speedLimitMB && !it.fastFailed && this.sites) {

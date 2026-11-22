@@ -1,4 +1,5 @@
 'use strict';
+const { tmpdir } = require('./helpers/tmp');
 // The downloader against sites that fight back: connection limits, fast-start-then-slow, expiring
 // links, stalls, "slow down" answers, other servers with the same file, and carrying on after a pause.
 const test = require('node:test');
@@ -9,7 +10,7 @@ const path = require('path');
 const { fastGet, resetPools, stateFile } = require('../src/main/fastget');
 const { serve, videoBytes, sha, MB } = require('./helpers/server');
 
-const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fl-')), 'out.mp4');
+const tmpFile = () => path.join(tmpdir('fl-'), 'out.mp4');
 const timed = async (fn) => { const t = Date.now(); const r = await fn(); return [r, Date.now() - t]; };
 test.beforeEach(() => resetPools());
 
@@ -276,5 +277,26 @@ test('more connections get tried again after a while (the limit isn\'t stuck low
   try {
     const r = await fastGet(srv.base + '/v.mp4', tmpFile(), { connections: 6, learnedLimit: 1, rampEvery: 2 });
     assert.ok(r.limit > 1 && r.connections > 1, `went up to ${r.limit} (${r.connections} at once)`);
+  } finally { srv.server.close(); }
+});
+
+test('a site with lots of server hiccups (half of all pieces get "500 error", one connection): still finishes, file right', async () => {
+  const file = videoBytes(48 * MB);
+  const srv = await serve(file, { failRate: 0.5 });
+  try {
+    const out = tmpFile();
+    const r = await fastGet(srv.base + '/v.mp4', out, { connections: 1 });
+    assert.equal(sha(fs.readFileSync(out)), sha(file));
+    assert.equal(r.split, true);
+    assert.ok(srv.stats.requests > 16, 'there really were many hiccups: ' + srv.stats.requests + ' requests for 12 pieces');
+  } finally { srv.server.close(); }
+});
+
+test('server hiccups never count as "too many connections" (the connection count stays up)', async () => {
+  const file = videoBytes(24 * MB);
+  const srv = await serve(file, { failRate: 0.3, throttle: 256 * 1024 });
+  try {
+    const r = await fastGet(srv.base + '/v.mp4', tmpFile(), { connections: 4 });
+    assert.ok(r.limit === null || r.limit >= 3, 'limit stayed up: ' + r.limit);
   } finally { srv.server.close(); }
 });
